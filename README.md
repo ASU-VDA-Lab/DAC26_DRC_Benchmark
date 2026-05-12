@@ -24,16 +24,17 @@ Two tasks are evaluated:
 
 ## Quick reference
 
-- `Dockerfile.repair` — repair-task image (AlmaLinux 8.10 + KLayout 0.30.1 + Cursor / Claude Code / Codex CLIs).
-- `Dockerfile.detection` — detection-task image; ships without KLayout, with iptables blocklist on klayout / package-index domains so the agent cannot recover the golden DRC answer.
-- `docker/` — entrypoint helpers (firewall + blocklist).
-- `src/` — pipeline orchestration scripts (`run_pipeline_*.sh`, `evaluate_*.sh`, `lib_helpers.sh`, `build_case_info.py`). See [`src/README.md`](./src/README.md).
-- `agent/` — unified LLM agent layer (`agent.py` dispatcher, prompt JSON templates, `skill.md`, backends). See [`agent/README.md`](./agent/README.md).
-- `evaluator/` — trusted score-phase bundle (DRC runner, scorers, sanity / connectivity, manifest, `trusted_bin/`). See [`evaluator/README.md`](./evaluator/README.md).
-- `testcase/` — ASAP7 PDK + 594 cases (`cell` 255 / `polygon` 332 / `block` 7). See [`testcase/README.md`](./testcase/README.md).
-- `CASE_STAT.md` — per-design-type and per-case statistics (violation counts, rule frequencies, die / core area).
-- `scripts/` — one-time setup (`build_trusted_bin.sh`, `build_seccomp_profile.sh`).
-- `result/`, `score/`, `task/`, `temp/`, `logs/` — runtime I/O (auto-created).
+- [`Dockerfile.repair`](./Dockerfile.repair) — repair-task image (AlmaLinux 8.10 + KLayout 0.30.1 + Cursor / Claude Code / Codex CLIs).
+- [`Dockerfile.detection`](./Dockerfile.detection) — detection-task image; ships without KLayout, with iptables blocklist on klayout / package-index domains so the agent cannot recover the golden DRC answer.
+- [`docker/`](./docker) — entrypoint helpers (firewall + blocklist).
+- [`src/`](./src) — pipeline orchestration scripts (`run_pipeline_*.sh`, `evaluate_*.sh`, `lib_helpers.sh`, `build_case_info.py`). See [`src/README.md`](./src/README.md).
+- [`agent/`](./agent) — unified LLM agent layer (`agent.py` dispatcher, prompt JSON templates, `skill.md`, backends). See [`agent/README.md`](./agent/README.md).
+- [`CUSTOM_AGENT.md`](./CUSTOM_AGENT.md) — contract guide for building a custom agentic flow (required filenames, CLI signature, stderr markers, info.json placeholders, minimum-viable skeleton).
+- [`evaluator/`](./evaluator) — trusted score-phase bundle (DRC runner, scorers, sanity / connectivity, manifest, `trusted_bin/`). See [`evaluator/README.md`](./evaluator/README.md).
+- [`testcase/`](./testcase) — ASAP7 PDK + 594 cases (`cell` 255 / `polygon` 332 / `block` 7). See [`testcase/README.md`](./testcase/README.md).
+- [`CASE_STAT.md`](./CASE_STAT.md) — per-design-type and per-case statistics (violation counts, rule frequencies, die / core area).
+- [`scripts/`](./scripts) — one-time setup (`build_trusted_bin.sh`, `build_seccomp_profile.sh`).
+- [`result/`](./result), [`score/`](./score), [`task/`](./task), [`temp/`](./temp), [`logs/`](./logs) — runtime I/O (auto-created).
 
 ## Quick start
 
