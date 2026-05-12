@@ -64,6 +64,14 @@ while [[ "${1:-}" == --* ]]; do
     esac
 done
 
+# In --score-only mode, read helper scripts (parse_info_json,
+# postprocess_info_json, check_connectivity) from the manifest-verified
+# /workspace/evaluator/ bundle that the host injected after agent kill, not
+# from /workspace/evaluator_helpers/ which the agent may have tampered.
+if [[ "${phase}" == "score" && -d "${evaluator_dir}" ]]; then
+    helpers_dir="${evaluator_dir}"
+fi
+
 if [[ "$#" -ne 1 ]]; then
     echo "Usage: bash src/run_pipeline_cursor.sh [--agent-only|--score-only] <info.json>" >&2
     exit 1

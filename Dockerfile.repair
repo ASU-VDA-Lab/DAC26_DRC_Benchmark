@@ -44,7 +44,7 @@
 #
 # Prerequisites (Cursor Agent CLI):
 #   curl https://cursor.com/install -fsS | bash
-#   cursor login
+#   agent login
 #
 # Prerequisites (Claude Code CLI):
 #   curl -fsSL https://claude.ai/install.sh | bash

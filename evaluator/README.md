@@ -7,8 +7,8 @@ Source-of-truth for the score / render / DRC / sanity / connectivity logic. Invi
 ## Trust model
 
 - The container's agent phase **never** sees `/workspace/evaluator/`. The agent only gets a minimal `evaluator_helpers/` subset (`parse_info_json.py`, `postprocess_info_json.py`, `check_connectivity.py`) for prompt parsing and self-checks.
-- Score phase entry sequence (host-side, in `lib_helpers.sh`): `kill_leftover_processes` -> `disconnect_container_network` -> `docker exec rm -rf /workspace/evaluator_helpers` -> `docker cp evaluator/. <cid>:/workspace/evaluator/` -> overwrite `/usr/local/bin/{bash,python3,sha256sum}-trusted` from `evaluator/trusted_bin/`.
-- Every score-phase `docker exec` is wrapped by `secured-exec.sh` and runs with `HARDENED_EVALUATION=1` and `EVALUATOR_DIR=/workspace/evaluator`. The wrapper re-checks that `EVALUATOR_HELPERS_DIR` is empty (agent-phase env must not leak into score phase).
+- Score phase entry sequence (host-side, in `lib_helpers.sh`): `kill_leftover_processes` -> `disconnect_container_network` -> `docker cp evaluator/. <cid>:/workspace/evaluator/` -> overwrite `/usr/local/bin/{bash,python3,sha256sum}-trusted` from `evaluator/trusted_bin/`. `/workspace/evaluator_helpers/` is left in place from the agent phase but is no longer trusted by scoring: `run_pipeline_*.sh` overrides `helpers_dir` to `${evaluator_dir}` when `phase=score`, so every score-phase `parse_info_json.py` / `postprocess_info_json.py` / `check_connectivity.py` call reads from the manifest-verified `/workspace/evaluator/` copy.
+- Every score-phase `docker exec` is wrapped by `secured-exec.sh` and runs with `HARDENED_EVALUATION=1` and `EVALUATOR_DIR=/workspace/evaluator`. The wrapper sanitizes `EVALUATOR_HELPERS_DIR` via its env allowlist (`: "${EVALUATOR_HELPERS_DIR:=}"`), forwarding only the empty default when the agent-phase env was not propagated.
 - `verify_evaluator_bundle` is the first step of the score block; it reads `evaluator.sha256` and compares each file (fail-closed exit 1).
 
 ## Files
@@ -17,19 +17,19 @@ Source-of-truth for the score / render / DRC / sanity / connectivity logic. Invi
 |---|---|
 | `parse_info_json.py` | info.json -> shell var assignments (also exposed in agent-phase `evaluator_helpers/`). |
 | `postprocess_info_json.py` | Rewrite info.json paths to container view. |
-| `check_connectivity.py` | Connectivity verifier (cell / block); also exposed in agent-phase helpers (K2). |
+| `check_connectivity.py` | Connectivity verifier (cell / block); also exposed in agent-phase helpers for the agent's own self-check. |
 | `score_repair.py` | Repair scorer (`repair_rate`, `new_violation_rate`). |
-| `score_detection.py` | Detection scorer (geometry-based matching, schema validate; F43). |
+| `score_detection.py` | Detection scorer (geometry-based matching, schema validate). |
 | `run_klayout_drc.py` | KLayout DRC runner. |
 | `process_klayout_reports.py` | `.lyrpt` -> `.drc.json` (`--fix-dots` substitutes containing polygon bbox). |
-| `sanity_check.py` | GDS integrity validator; dynamic-loads sibling `check_connectivity.py` (F1 invariant — must stay co-located). |
+| `sanity_check.py` | GDS integrity validator; dynamic-loads sibling `check_connectivity.py` (must stay co-located). |
 | `prepare_render_script.py` | Rewrite `layout.write()` path before render. |
 | `merge_score_sanity.py` / `merge_score_connectivity.py` | Merge fields into score JSON. |
-| `write_score_csv.py` | Score JSON -> CSV row (None -> "NULL"; fixed fieldnames; F40). |
-| `write_invalid_score.py` | Fail-closed invalid-score emitter (F39). |
-| `log_runtime.py` / `read_score_field.py` | Append `runtime.csv` / read single score field. |
-| `evaluator.sha256` | Manifest verified at score-phase entry (Phase 4.1). |
-| `trusted_bin/{bash,python3,sha256sum}` | GNU coreutils binaries; copied to `/usr/local/bin/*-trusted` (Phase 1.4). `.hash` covers all three. |
+| `write_score_csv.py` | Score JSON -> CSV row (None -> "NULL"; fixed fieldnames). |
+| `write_invalid_score.py` | Fail-closed invalid-score emitter. |
+| `log_runtime.py` | Append per-run row to `runtime.csv`. |
+| `evaluator.sha256` | Manifest verified at score-phase entry by `verify_evaluator_bundle.sh`. |
+| `trusted_bin/{bash,python3,sha256sum}` | GNU coreutils binaries; copied to `/usr/local/bin/*-trusted` by `reinject_critical_binaries`. `.hash` covers all three. |
 
 ## Manifest and injection sequence
 
@@ -43,9 +43,8 @@ Source-of-truth for the score / render / DRC / sanity / connectivity logic. Invi
 1. Agent phase exits and `docker exec` returns.
 2. Host runs `kill_leftover_processes` (`docker top` + `kill -9`).
 3. Host runs `docker network disconnect`.
-4. Host runs `docker exec rm -rf /workspace/evaluator_helpers`.
-5. Host `docker cp evaluator/. <cid>:/workspace/evaluator/` and overwrites `bash-trusted` / `python3-trusted` / `sha256sum-trusted` from `trusted_bin/`.
-6. Score block starts with `verify_evaluator_bundle` (fail-closed).
+4. Host `docker cp evaluator/. <cid>:/workspace/evaluator/` and overwrites `bash-trusted` / `python3-trusted` / `sha256sum-trusted` from `trusted_bin/`. `/workspace/evaluator_helpers/` is left intact from the agent phase; the score block reads its helpers from `/workspace/evaluator/` (manifest-verified) instead.
+5. Score block starts with `verify_evaluator_bundle` (fail-closed).
 
 ## Manifest regeneration note
 
@@ -57,7 +56,7 @@ Source-of-truth for the score / render / DRC / sanity / connectivity logic. Invi
 2. `docker exec` env must carry `EVALUATOR_DIR=/workspace/evaluator` and `HARDENED_EVALUATION=1`.
 3. The score block reverse-checks that `EVALUATOR_HELPERS_DIR` is empty.
 4. `verify_evaluator_bundle` runs first and is fail-closed.
-5. `trusted_bin/{bash,python3,sha256sum}` must be GNU coreutils format (F38, round-8); Phase 8.4 smoke verifies against `.hash`.
+5. `trusted_bin/{bash,python3,sha256sum}` must be GNU coreutils format; the smoke test verifies them against `.hash`.
 
 ## Score JSON schema
 

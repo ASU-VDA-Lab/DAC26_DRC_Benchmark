@@ -33,7 +33,7 @@ bash src/evaluate_claude.sh
 bash src/evaluate_codex.sh
 ```
 
-`info.json` schema lives in [`agent/README.md`](../agent/README.md) (Example info.json). `output_path` and `temp_dir` are overwritten by the pipeline with computed container paths.
+`info.json` field list lives in [`CUSTOM_AGENT.md`](../CUSTOM_AGENT.md) under "info.json fields available to your prompt template". `output_path` and `temp_dir` are overwritten by the pipeline with computed container paths.
 
 ## Pipeline steps
 
@@ -58,5 +58,6 @@ All console output is also captured to `logs/<run_id>_<design_type>_<task_type>_
 
 ## See also
 
-- [`../agent/README.md`](../agent/README.md) — agent dispatcher, backends, prompt schema, example info.json.
+- [`../agent/README.md`](../agent/README.md) — agent dispatcher, backends, prompt schema.
+- [`../CUSTOM_AGENT.md`](../CUSTOM_AGENT.md) — info.json field list and the agent CLI / stderr contracts.
 - [`../evaluator/README.md`](../evaluator/README.md) — trusted score bundle and helpers invoked from steps 4–7.

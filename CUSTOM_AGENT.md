@@ -53,10 +53,10 @@ You can:
 | `src/` (entire) | Pipeline orchestration: `run_pipeline_*.sh`, `evaluate_*.sh`, `lib_helpers.sh`. |
 | `testcase/` (entire) | Frozen evaluation inputs (594 ASAP7 cases). |
 | `docker/`, `Dockerfile.*`, `scripts/` | Container hardening and one-time setup. |
-| `agent/agent.py` **filename** | Hard-coded as `AGENT_SCRIPT="${agent_dir}/agent.py"` in `run_pipeline_*.sh:191`. |
-| `agent/prompt_format.py` **filename** | Hard-coded in `run_pipeline_*.sh:256`. |
-| `agent/skill.md` **filename** | Hard-coded in `evaluate_*.sh` and `run_pipeline_*.sh`. |
-| `agent/prompts/<task>.json` **filenames** | Hard-coded glob in `run_pipeline_*.sh:168-174`. |
+| `agent/agent.py` **filename** | Hard-coded as `AGENT_SCRIPT="${agent_dir}/agent.py"` in each `run_pipeline_*.sh` (grep `AGENT_SCRIPT=`). |
+| `agent/prompt_format.py` **filename** | Hard-coded in each `run_pipeline_*.sh` (grep `prompt_format.py`). |
+| `agent/skill.md` **filename** | Hard-coded in `evaluate_*.sh` and `run_pipeline_*.sh` (grep `skill_file=`). |
+| `agent/prompts/<task>.json` **filenames** | Hard-coded prompt-template selection in each `run_pipeline_*.sh` (grep `prompts/repair_` / `prompts/${task_type}`). |
 
 **File contents** are yours; **paths** are not. Renaming `agent/skill.md` to `agent/my_knowledge.md` breaks `evaluate_*.sh` at file-not-found before any case runs.
 
@@ -66,7 +66,7 @@ You can:
 
 ### Contract 1 — `agent/agent.py` CLI arguments
 
-`run_pipeline_*.sh:286,495` invokes the dispatcher like this:
+Each `run_pipeline_*.sh` (grep `python3 "${AGENT_SCRIPT}"`) invokes the dispatcher like this:
 
 ```bash
 python3 agent/agent.py \
@@ -77,11 +77,13 @@ python3 agent/agent.py \
     --workspace /workspace \
     --temp_dir <path> \
     [--fallback <orig_script>] \     # repair only
-    --raw-json-out <path.json> \
+    [--raw-json-out <path.json>] \   # always passed today, but accept missing for forward-compat
     [--effort {high|medium|low}]
 ```
 
-If your flow does not use some of these, still declare them in `argparse` and ignore the value internally — do **not** make them error. Unknown flags also must not error (since future pipeline revisions may add more).
+If your flow does not use some of these, still declare them in `argparse` and ignore the value internally — do **not** make them error.
+
+Future pipeline revisions may add more flags. The reference `agent.py` uses `parser.parse_args()`, which **does** error on unknown flags; if you want to be forward-compatible, prefer `parser.parse_known_args()` so an unrecognized flag from a newer pipeline does not blow up your run.
 
 ### Contract 2 — `agent/agent.py` stderr markers
 
@@ -93,7 +95,7 @@ TOKENS_JSON={"input_tokens": N, "output_tokens": N, "cache_read_tokens": N, "cac
 RUNTIME_SECONDS=12.345
 ```
 
-- `STATUS` must be `success` or `fail`; anything else is coerced to `fail` by the host parser (`lib_helpers.sh:314-318`).
+- `STATUS` must be `success` or `fail`; anything else is coerced to `fail` by the host parser in `lib_helpers.sh` (grep `===== STATUS =====`).
 - `TOKENS_JSON` keys must be exactly those four names; extra keys are stripped.
 - `RUNTIME_SECONDS` must match `^[0-9]+(\.[0-9]+)?$`.
 
@@ -101,7 +103,7 @@ If your agent has no real token counts (e.g. a non-API backend), emit zeros — 
 
 ### Contract 3 — `agent/prompt_format.py` CLI
 
-`run_pipeline_*.sh:256` invokes the renderer like this:
+Each `run_pipeline_*.sh` (grep `prompt_format.py`) invokes the renderer like this:
 
 ```bash
 python3 agent/prompt_format.py <case_info_json> <prompt_template_json> > <formatted_prompt.md>
@@ -136,9 +138,10 @@ parser.add_argument("--task_type", required=True)
 parser.add_argument("--workspace", required=True)
 parser.add_argument("--temp_dir", required=True)
 parser.add_argument("--fallback", default=None)
-parser.add_argument("--raw-json-out", dest="raw_json_out", required=True)
+parser.add_argument("--raw-json-out", dest="raw_json_out", default=None)
 parser.add_argument("--effort", default=None)
-args = parser.parse_args()
+# parse_known_args() so a future pipeline flag does not abort the run.
+args, _unknown = parser.parse_known_args()
 
 start = time.time()
 try:
@@ -166,25 +169,32 @@ print(f"STATUS={status}", file=sys.stderr)
 print(f"TOKENS_JSON={json.dumps(tokens)}", file=sys.stderr)
 print(f"RUNTIME_SECONDS={time.time()-start:.3f}", file=sys.stderr)
 
-# Write raw JSON (your own format)
-with open(args.raw_json_out, "w") as f:
-    json.dump({"tokens": tokens, "status": status}, f)
+# Write raw JSON (your own format) when the pipeline asks for it
+if args.raw_json_out:
+    with open(args.raw_json_out, "w") as f:
+        json.dump({"tokens": tokens, "status": status}, f)
 
 sys.exit(0)
 ```
 
 ```python
 # agent/prompt_format.py
-import json, sys, string
+# Must read the same 6-key schema that the shipped prompts/*.json files use:
+#   task, schema_version, system, user_template, variables, output_format
+# `user_template` (not `user`) is the placeholder body; every ${var} placeholder
+# in it must be declared in the `variables` list, or you will get a ValueError.
+import json, string, sys
 
 class _SafeDict(dict):
     def __missing__(self, key):
-        return "{" + key + "}"
+        return "${" + key + "}"
 
 info = json.load(open(sys.argv[1]))
 template = json.load(open(sys.argv[2]))
-rendered = string.Template(template["user"]).safe_substitute(_SafeDict(info))
-print(rendered)
+
+system = template.get("system", "")
+user = string.Template(template["user_template"]).safe_substitute(_SafeDict(info))
+sys.stdout.write(f"{system}\n\n{user}\n" if system else user + "\n")
 ```
 
 ```markdown
@@ -193,20 +203,29 @@ print(rendered)
 ```
 
 ```json
-// agent/prompts/detection.json
-{ "user": "Find DRC violations in:\n${path_to_layout_script}\n\nRules: ${path_to_design_rule}" }
+// agent/prompts/detection.json -- must keep the 6-key schema
+{
+  "task": "detection",
+  "schema_version": "1.0",
+  "system": "You are an EDA engineer who performs static DRC detection.",
+  "user_template": "Find DRC violations in:\n${path_to_layout_script}\n\nRules: ${path_to_design_rule}\nWrite the JSON result to ${output_path}.",
+  "variables": ["path_to_layout_script", "path_to_design_rule", "output_path"],
+  "output_format": { "kind": "json", "description": "Array of violation objects." }
+}
 ```
 
 (Provide similar templates for `repair_cell.json`, `repair_polygon.json`, `repair_block.json`.)
 
-After dropping these in, **rebuild the docker images** (`src/` and `agent/` are baked in):
+If you rewrite `prompt_format.py` with a different template schema, you must rewrite **all four** `prompts/*.json` files in lockstep — the shipped `prompt_format.py` and the shipped prompt JSONs are coupled, and mixing the two will fail validation.
+
+Then run `bash src/evaluate_claude.sh` (or whichever runner matches your backend).
+
+**No image rebuild is needed** when you only change `agent/`. `evaluate_*.sh` bind-mounts `agent/` into the container read-only (`-v ${host_dir}/agent:/workspace/agent:ro`), so your edits are picked up on the next run. Rebuild the images only when `src/`, `evaluator/`, `testcase/`, `docker/`, or `Dockerfile.*` themselves change — but per the modification policy, you should not be editing those:
 
 ```bash
 docker build -f Dockerfile.repair    -t drc-benchmark-repair    .
 docker build -f Dockerfile.detection -t drc-benchmark-detection .
 ```
-
-Then run `bash src/evaluate_claude.sh` (or whichever runner matches your backend).
 
 ---
 

@@ -2,6 +2,11 @@
 
 Benchmark for evaluating LLMs on ASAP7 KLayout DRC repair and detection inside a self-contained Docker container.
 
+Two tasks are evaluated:
+
+- **Detection** — the agent sees a layout (a KLayout Python script) **without** the golden DRC report, and must predict which design rules are violated and where (edge pairs for spacing rules, bounding boxes otherwise). Scored against the golden DRC report by Hopcroft–Karp maximum bipartite matching per rule (Precision / Recall / F1).
+- **Repair** — the agent sees a layout **plus** the golden DRC report listing every violation, and must produce a modified layout script that resolves the violations. Scored by re-running KLayout DRC on the agent's output and comparing to the golden (`repair_rate`, `new_violation_rate`, `connectivity_preserved`).
+
 ## Modification policy
 
 **Only `agent/` is user-modifiable.** Everything else (scoring code, orchestration, Docker hardening, test cases, helper scripts) is part of the frozen benchmark infrastructure; modifying it invalidates the result for cross-submission comparison.
@@ -26,6 +31,7 @@ Benchmark for evaluating LLMs on ASAP7 KLayout DRC repair and detection inside a
 - `agent/` — unified LLM agent layer (`agent.py` dispatcher, prompt JSON templates, `skill.md`, backends). See [`agent/README.md`](./agent/README.md).
 - `evaluator/` — trusted score-phase bundle (DRC runner, scorers, sanity / connectivity, manifest, `trusted_bin/`). See [`evaluator/README.md`](./evaluator/README.md).
 - `testcase/` — ASAP7 PDK + 594 cases (`cell` 255 / `polygon` 332 / `block` 7). See [`testcase/README.md`](./testcase/README.md).
+- `CASE_STAT.md` — per-design-type and per-case statistics (violation counts, rule frequencies, die / core area).
 - `scripts/` — one-time setup (`build_trusted_bin.sh`, `build_seccomp_profile.sh`).
 - `result/`, `score/`, `task/`, `temp/`, `logs/` — runtime I/O (auto-created).
 
@@ -45,7 +51,7 @@ Benchmark for evaluating LLMs on ASAP7 KLayout DRC repair and detection inside a
   curl -fsSL https://claude.ai/install.sh | bash
   claude login
   ```
-  The login credentials at `~/.claude/` are bind-mounted (read-only) into the container at runtime.
+  The login credentials at `~/.claude/.credentials.json` are bind-mounted (read-only) into the container at runtime.
 - **Codex CLI on the host** (for Codex pipeline) — install and log in:
   ```bash
   npm install -g @openai/codex@0.124.0
@@ -83,8 +89,11 @@ CASE=Cell1
 DESIGN=cell
 CONTAINER=drc-bench-$CASE
 
+# agent/ and evaluator/ are NOT baked into the image; bind-mount agent/ and
+# docker cp evaluator/ in at the right times (mirrors evaluate_cursor.sh).
 docker create --name "$CONTAINER" \
     -v "$HOME/.config/cursor/auth.json:/root/.config/cursor/auth.json:ro" \
+    -v "$(pwd)/agent:/workspace/agent:ro" \
     -v "$(pwd)/result:/workspace/result" \
     -v "$(pwd)/score:/workspace/score" \
     -v "$(pwd)/logs:/workspace/logs" \
@@ -94,6 +103,19 @@ docker create --name "$CONTAINER" \
 docker start "$CONTAINER"
 
 docker cp info.json "$CONTAINER:/workspace/task/info.json"
+
+# Inject helper-script subset that the pipeline needs in the agent phase
+# (parse_info_json, postprocess_info_json, check_connectivity for self-check).
+docker exec "$CONTAINER" mkdir -p /workspace/evaluator_helpers
+for f in parse_info_json.py postprocess_info_json.py check_connectivity.py; do
+    docker cp "evaluator/$f" "$CONTAINER:/workspace/evaluator_helpers/$f"
+done
+
+# Inject the full trusted evaluator/ bundle so the score phase can run.
+docker exec "$CONTAINER" mkdir -p /workspace/evaluator
+docker cp evaluator/. "$CONTAINER:/workspace/evaluator/"
+
+# Repair sees the golden DRC report (legitimate input).
 docker exec "$CONTAINER" mkdir -p "/workspace/testcase/asap7/$DESIGN/drc_report"
 docker cp "testcase/asap7/$DESIGN/drc_report/$CASE.drc.json" \
     "$CONTAINER:/workspace/testcase/asap7/$DESIGN/drc_report/"
@@ -112,8 +134,12 @@ CASE=Cell1
 DESIGN=cell
 CONTAINER=drc-bench-$CASE
 
+# agent/ and evaluator/ are NOT baked into the image; bind-mount agent/ now
+# and docker cp the full evaluator/ bundle only after the agent phase ends
+# (so it stays invisible during agent execution).
 docker create --name "$CONTAINER" --cap-add=NET_ADMIN \
     -v "$HOME/.claude/.credentials.json:/root/.claude/.credentials.json:ro" \
+    -v "$(pwd)/agent:/workspace/agent:ro" \
     -v "$(pwd)/result:/workspace/result" \
     -v "$(pwd)/score:/workspace/score" \
     -v "$(pwd)/logs:/workspace/logs" \
@@ -124,15 +150,26 @@ docker start "$CONTAINER"
 
 docker cp info.json "$CONTAINER:/workspace/task/info.json"
 
-# Phase 1: agent-only (golden report NOT yet in container).
-# CLAUDE_EFFORT is required by run_pipeline_claude.sh (see src/README.md).
+# Inject only the helper subset for the agent phase; the full evaluator
+# bundle stays out of /workspace/ until after the agent finishes.
+docker exec "$CONTAINER" mkdir -p /workspace/evaluator_helpers
+for f in parse_info_json.py postprocess_info_json.py check_connectivity.py; do
+    docker cp "evaluator/$f" "$CONTAINER:/workspace/evaluator_helpers/$f"
+done
+
+# Phase 1: agent-only (golden report NOT yet in container; evaluator/ NOT
+# yet in container). CLAUDE_EFFORT is required by run_pipeline_claude.sh
+# (see src/README.md).
 docker exec -e CLAUDE_EFFORT=high "$CONTAINER" \
     bash src/run_pipeline_claude.sh --agent-only /workspace/task/info.json
 
-# Phase 2: inject golden report, then score.
+# Phase 2: inject golden report + full evaluator bundle, then score.
 docker exec "$CONTAINER" mkdir -p "/workspace/testcase/asap7/$DESIGN/drc_report"
 docker cp "testcase/asap7/$DESIGN/drc_report/$CASE.drc.json" \
     "$CONTAINER:/workspace/testcase/asap7/$DESIGN/drc_report/"
+docker exec "$CONTAINER" mkdir -p /workspace/evaluator
+docker cp evaluator/. "$CONTAINER:/workspace/evaluator/"
+
 docker exec -e CLAUDE_EFFORT=high "$CONTAINER" \
     bash src/run_pipeline_claude.sh --score-only /workspace/task/info.json
 
@@ -148,8 +185,11 @@ CASE=Cell1
 DESIGN=cell
 CONTAINER=drc-bench-$CASE
 
+# agent/ and evaluator/ are NOT baked into the image; bind-mount agent/ and
+# docker cp evaluator/ in at the right times (mirrors evaluate_codex.sh).
 docker create --name "$CONTAINER" \
     -v "$HOME/.codex/auth.json:/root/.codex/auth.json:ro" \
+    -v "$(pwd)/agent:/workspace/agent:ro" \
     -v "$(pwd)/result:/workspace/result" \
     -v "$(pwd)/score:/workspace/score" \
     -v "$(pwd)/logs:/workspace/logs" \
@@ -159,6 +199,16 @@ docker create --name "$CONTAINER" \
 docker start "$CONTAINER"
 
 docker cp info.json "$CONTAINER:/workspace/task/info.json"
+
+# Inject helper-script subset + full evaluator bundle (repair runs as a
+# single --full phase here, so both are needed before bash src/run_pipeline_*).
+docker exec "$CONTAINER" mkdir -p /workspace/evaluator_helpers /workspace/evaluator
+for f in parse_info_json.py postprocess_info_json.py check_connectivity.py; do
+    docker cp "evaluator/$f" "$CONTAINER:/workspace/evaluator_helpers/$f"
+done
+docker cp evaluator/. "$CONTAINER:/workspace/evaluator/"
+
+# Repair sees the golden DRC report (legitimate input).
 docker exec "$CONTAINER" mkdir -p "/workspace/testcase/asap7/$DESIGN/drc_report"
 docker cp "testcase/asap7/$DESIGN/drc_report/$CASE.drc.json" \
     "$CONTAINER:/workspace/testcase/asap7/$DESIGN/drc_report/"
@@ -199,6 +249,7 @@ Step-level details live in [`src/README.md`](./src/README.md); trusted-bundle in
 ## Trust boundary index
 
 - Agent phase and score phase are strictly separated; the agent never sees `/workspace/evaluator/`.
+- For detection cases, `evaluator/postprocess_info_json.py` rewrites `path_to_drc_report` to the empty string in the agent-visible info.json — the gate that keeps the detection agent from reading the golden DRC report.
 - `Dockerfile.detection` ships without KLayout / wget / curl / pip / yum / git; entrypoint installs an iptables OUTPUT REJECT list on klayout.org / pypi.org / github.com / etc., then drops `NET_ADMIN` from the bounding set.
 - All score-phase `docker exec` calls go through `secured-exec.sh` with `HARDENED_EVALUATION=1` and `EVALUATOR_DIR=/workspace/evaluator`.
 - `evaluator.sha256` manifest is verified by `verify_evaluator_bundle` as the first step of the score phase (fail-closed).

@@ -48,7 +48,7 @@
 #     blocklist to prevent the agent from installing / invoking KLayout.)
 #   - Cursor CLI must be logged in on the host:
 #       curl https://cursor.com/install -fsS | bash
-#       cursor login
+#       agent login
 
 set -euo pipefail
 
