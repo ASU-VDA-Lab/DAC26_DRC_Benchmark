@@ -1,0 +1,40 @@
+# critical domains: github.com / api.github.com / raw.githubusercontent.com
+# must resolve successfully, otherwise entrypoint fail-closed
+
+# klayout official
+klayout.org
+www.klayout.org
+
+# Python package index
+pypi.org
+files.pythonhosted.org
+pythonhosted.org
+python.org
+www.python.org
+
+# GitHub (incl. benchmark repo)
+github.com
+www.github.com
+api.github.com
+raw.githubusercontent.com
+codeload.github.com
+objects.githubusercontent.com
+github-releases.githubusercontent.com
+gist.github.com
+
+# Other source hosts
+gitlab.com
+bitbucket.org
+
+# Conda / Anaconda
+conda.anaconda.org
+repo.anaconda.com
+pkgs.anaconda.com
+
+# Other package distribution
+sourceforge.net
+dl.fedoraproject.org
+rpmfind.net
+mirrors.kernel.org
+mirrorservice.org
+ftp.gnu.org

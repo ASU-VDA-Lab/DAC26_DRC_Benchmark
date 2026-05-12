@@ -30,7 +30,8 @@
 # Build the info.json for a specific test case.
 #
 # Used by evaluate_cursor.sh to reproduce the paper's experiment table.
-# To run a single case, prepare your own info.json (see example/info.json)
+# To run a single case, prepare your own info.json (see agent/README.md
+# "Example info.json" section, or testcase/<design>/<case>/ fixtures)
 # and call run_pipeline_cursor.sh directly.
 #
 # Usage (named args -- used by evaluate_cursor.sh on the host):

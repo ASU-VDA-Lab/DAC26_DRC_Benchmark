@@ -77,7 +77,16 @@ RUN yum downgrade -y \
     && yum clean all \
     && rm -rf /var/cache/yum
 
-RUN alternatives --set iptables /usr/sbin/iptables-legacy 2>/dev/null || true
+# AlmaLinux 8.10 only ships the nft-backed `iptables` (xtables-nft-multi) and
+# does not provide an iptables-legacy alternative. Try to switch to legacy if
+# present (older base images), otherwise fall through to nft and emit a
+# WARNING — entrypoint-firewall.sh tolerates both backends.
+RUN if [ -e /usr/sbin/iptables-legacy ]; then \
+        alternatives --set iptables /usr/sbin/iptables-legacy \
+        || echo "WARNING: alternatives --set iptables-legacy failed; continuing with current backend"; \
+    else \
+        echo "WARNING: iptables-legacy not present on this base image; continuing with nft backend"; \
+    fi
 
 # ---------------------------------------------------------------------------
 # Install shapely via pip (needed for connectivity check), then scrub pip.
@@ -95,6 +104,25 @@ RUN rm -f /usr/bin/pip /usr/bin/pip3 /usr/bin/pip-3 /usr/local/bin/pip \
     && rm -rf /usr/lib/python3.6/site-packages/pip \
               /usr/lib/python3.6/site-packages/pip-*.dist-info \
               /usr/lib/python3.6/site-packages/pip-*.egg-info
+
+# ---------------------------------------------------------------------------
+# Runtime hardening dependencies — installed BEFORE the yum-strip
+# block below, because that block deletes /usr/bin/yum and we still need yum
+# here to install procps-ng / tini / libcap / e2fsprogs (iptables already
+# installed earlier).
+#   - procps-ng : ps / kill / pgrep
+#   - tini      : PID 1 init reaping zombies
+#   - libcap    : capsh (entrypoint cap drop / secured-exec wrapper)
+#   - e2fsprogs : chattr (cleanup defence in depth)
+# detection fix: explicitly install e2fsprogs so chattr is available
+# for cleanup; otherwise immutable-bypass detection silently
+# fails.
+# ---------------------------------------------------------------------------
+RUN yum install -y epel-release \
+    && yum install -y procps-ng tini libcap e2fsprogs \
+    && yum remove -y epel-release \
+    && yum clean all \
+    && rm -rf /var/cache/yum /etc/yum.repos.d/epel*.repo
 
 # ---------------------------------------------------------------------------
 # Strip tools the agent could use to fetch or build klayout.
@@ -130,10 +158,22 @@ RUN rm -rf /usr/lib/node_modules/npm \
     2>/dev/null || true
 
 # ---------------------------------------------------------------------------
-# Runtime entrypoint: sets up iptables blocklist for klayout-related domains.
+# Runtime entrypoint chain:
+#   tini (PID 1) -> entrypoint-firewall.sh (apply iptables + capsh drop=all
+#   + re-add 6 caps) -> CMD ["sleep", "infinity"]
+# secured-exec.sh: docker exec wrapper (env -i sanitize + capsh); all
+# agent / score / cleanup docker exec calls must go through this wrapper.
+# blocklist.txt: plaintext host list, read by entrypoint and applied as iptables REJECT.
+# seccomp-no-iptables.json: belt-and-suspenders seccomp profile, merged by
+# scripts/build_seccomp_profile.sh from moby v24.0.7 default + extra rules;
+# loaded via evaluate_*.sh `--security-opt seccomp=...`.
 # ---------------------------------------------------------------------------
-COPY docker/entrypoint-blocklist.sh /usr/local/bin/entrypoint-blocklist.sh
-RUN chmod +x /usr/local/bin/entrypoint-blocklist.sh
+COPY docker/entrypoint-firewall.sh   /usr/local/bin/entrypoint-firewall.sh
+COPY docker/secured-exec.sh          /usr/local/bin/secured-exec.sh
+COPY docker/blocklist.txt            /etc/blocklist.txt
+COPY docker/seccomp-no-iptables.json /etc/seccomp-no-iptables.json
+RUN chmod +x /usr/local/bin/entrypoint-firewall.sh \
+             /usr/local/bin/secured-exec.sh
 
 ENV WORKSPACE=/workspace
 WORKDIR /workspace
@@ -155,5 +195,5 @@ RUN rm -rf /workspace/testcase/asap7/cell/drc_report/* \
                /workspace/testcase/asap7/polygon/drc_report \
                /workspace/testcase/asap7/block/drc_report
 
-ENTRYPOINT ["/usr/local/bin/entrypoint-blocklist.sh"]
-CMD ["bash", "-c", "echo 'Detection container with domain blocklist active. Call agent_claude.py, agent_cursor.py, or agent_codex.py.'"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint-firewall.sh"]
+CMD ["sleep", "infinity"]

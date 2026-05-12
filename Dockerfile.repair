@@ -44,7 +44,7 @@
 #
 # Prerequisites (Cursor Agent CLI):
 #   curl https://cursor.com/install -fsS | bash
-#   cursor login
+#   agent login
 #
 # Prerequisites (Claude Code CLI):
 #   curl -fsSL https://claude.ai/install.sh | bash
@@ -87,6 +87,30 @@
 #   bash src/evaluate_claude.sh          # Claude Code
 #   bash src/evaluate_codex.sh           # Codex
 
+# ===========================================================================
+# Stage 1: builder — gcc/git/wget/make/cmake/rpm-build for klayout RPM fetch
+# build-only tools confined to builder stage; final stage omits them
+# to prevent agent from using them to compile/fetch.
+# ===========================================================================
+FROM almalinux:8.10 AS builder
+
+RUN yum install -y \
+        wget-1.19.5-12.el8_10 \
+        ca-certificates \
+    && yum clean all \
+    && rm -rf /var/cache/yum
+
+WORKDIR /tmp
+# klayout.org's TLS cert is intermittently expired upstream (observed
+# 2026-05-09). The artifact itself is version-pinned (0.30.1) and validated
+# by RPM signature later, so we accept the cert chain warning here. If the
+# upstream cert is fixed this flag becomes a no-op.
+RUN wget --no-check-certificate -O /tmp/klayout-0.30.1.rpm \
+        https://www.klayout.org/downloads/CentOS_8/klayout-0.30.1-0.x86_64.rpm
+
+# ===========================================================================
+# Stage 2: final runtime image — no gcc/git/wget/make/cmake/rpm-build
+# ===========================================================================
 FROM almalinux:8.10
 
 # ---------------------------------------------------------------------------
@@ -114,6 +138,7 @@ RUN yum downgrade -y \
 
 # ---------------------------------------------------------------------------
 # Install all dependencies with pinned versions
+#   gcc / gcc-c++ / git / wget removed — moved to builder stage.
 # ---------------------------------------------------------------------------
 RUN yum install -y \
         # Python
@@ -150,21 +175,42 @@ RUN yum install -y \
         pulseaudio-libs-glib2-14.0-4.el8 \
         # Misc KLayout dependencies
         libgit2-0.26.8-2.el8 \
-        # Build tools
-        gcc-8.5.0-22.el8_10 \
-        gcc-c++-8.5.0-22.el8_10 \
-        git-2.43.5-1.el8_10 \
-        wget-1.19.5-12.el8_10 \
     && yum clean all \
     && rm -rf /var/cache/yum
 
 # ---------------------------------------------------------------------------
-# Download and install KLayout 0.30.1 from klayout.org
+# Install KLayout 0.30.1 from RPM produced in builder stage.
 # ---------------------------------------------------------------------------
-RUN wget -O /tmp/klayout-0.30.1.rpm \
-        https://www.klayout.org/downloads/CentOS_8/klayout-0.30.1-0.x86_64.rpm \
-    && rpm -Uvh --force --nodeps /tmp/klayout-0.30.1.rpm \
+COPY --from=builder /tmp/klayout-0.30.1.rpm /tmp/klayout-0.30.1.rpm
+RUN rpm -Uvh --force --nodeps /tmp/klayout-0.30.1.rpm \
     && rm -f /tmp/klayout-0.30.1.rpm
+
+# ---------------------------------------------------------------------------
+# Runtime hardening dependencies:
+#   - procps-ng : ps / kill / pgrep
+#   - tini      : PID 1 init reaping zombies
+#   - libcap    : capsh (entrypoint cap drop / secured-exec wrapper)
+#   - e2fsprogs : chattr (cleanup defence in depth)
+# Note: no iptables here — the repair container does not program an egress
+# blocklist (per the paper, network restriction applies only to detection).
+# ---------------------------------------------------------------------------
+RUN yum install -y epel-release \
+    && yum install -y procps-ng tini libcap e2fsprogs \
+    && yum remove -y epel-release \
+    && yum clean all \
+    && rm -rf /var/cache/yum /etc/yum.repos.d/epel*.repo
+
+# ---------------------------------------------------------------------------
+# Entrypoint chain + docker exec wrapper + seccomp.
+# entrypoint-no-firewall.sh keeps ld.so.preload sanitize + IPv6 fail-closed +
+# Phase-2 capsh cap-drop but omits the iptables OUTPUT REJECT programming
+# step. See docker/entrypoint-firewall.sh for the detection-side counterpart.
+# ---------------------------------------------------------------------------
+COPY docker/entrypoint-no-firewall.sh /usr/local/bin/entrypoint-no-firewall.sh
+COPY docker/secured-exec.sh           /usr/local/bin/secured-exec.sh
+COPY docker/seccomp-no-iptables.json  /etc/seccomp-no-iptables.json
+RUN chmod +x /usr/local/bin/entrypoint-no-firewall.sh \
+             /usr/local/bin/secured-exec.sh
 
 # ---------------------------------------------------------------------------
 # Configure Ruby environment for KLayout DRC engine
@@ -214,7 +260,7 @@ RUN rm -rf /workspace/testcase/asap7/cell/drc_report/* \
 
 # ---------------------------------------------------------------------------
 # Install Shapely for shape-aware connectivity generation
-# (used by src/check_connectivity.py)
+# (used by evaluator/check_connectivity.py)
 #
 # Python 3.6.8 is pinned by the base image, so we must use the 1.8.x
 # shapely series (shapely >= 2.0 requires Python >= 3.7). The 1.8.x
@@ -227,41 +273,10 @@ RUN pip3 install --upgrade "pip==21.3.1" \
     && pip3 install "shapely==1.8.5.post1"
 
 # ---------------------------------------------------------------------------
-# Default command: print usage
+# ENTRYPOINT chain: tini (PID 1) -> entrypoint-no-firewall.sh (capsh drop=all,
+# no iptables) -> CMD ["sleep","infinity"]. Once the container is up,
+# evaluate_*.sh enters the agent / score phase via
+# docker exec /usr/local/bin/secured-exec.sh bash run_pipeline_*.sh ...
 # ---------------------------------------------------------------------------
-CMD ["bash", "-c", "\
-echo ''; \
-echo 'DRC Benchmark Container (KLayout 0.30.1 + Cursor CLI + Claude Code CLI + Codex CLI)'; \
-echo '========================================================================'; \
-echo ''; \
-echo 'Prerequisites (choose one):'; \
-echo '  Cursor:      curl https://cursor.com/install -fsS | bash && cursor login'; \
-echo '  Claude Code:  curl -fsSL https://claude.ai/install.sh | bash && claude login'; \
-echo '  Codex:       npm install -g @openai/codex@0.124.0 && codex login'; \
-echo ''; \
-echo 'Single case:'; \
-echo '  Cursor:      bash src/run_pipeline_cursor.sh /workspace/task/info.json'; \
-echo '  Claude Code: bash src/run_pipeline_claude.sh /workspace/task/info.json'; \
-echo '  Codex:       CODEX_EFFORT=high bash src/run_pipeline_codex.sh /workspace/task/info.json'; \
-echo ''; \
-echo 'Paper experiments:'; \
-echo '  Cursor:      bash src/evaluate_cursor.sh'; \
-echo '  Claude Code: bash src/evaluate_claude.sh'; \
-echo '  Codex:       bash src/evaluate_codex.sh'; \
-echo ''; \
-echo 'Auth (bind-mount read-only from host):'; \
-echo '  Cursor:      -v ~/.config/cursor:/root/.config/cursor:ro'; \
-echo '  Claude Code: -v ~/.claude:/root/.claude:ro'; \
-echo '  Codex:       -v ~/.codex/auth.json:/root/.codex/auth.json:ro'; \
-echo ''; \
-echo 'Pipeline outputs (bind-mount these to retrieve from host):'; \
-echo '  Results: /workspace/result/<model_name>/<design_type>/<task_type>/<case_name>/'; \
-echo '  Scores:  /workspace/score/<model_name>/<design_type>/<task_type>/'; \
-echo '  Logs:    /workspace/logs/'; \
-echo ''; \
-echo 'Environment variables:'; \
-echo '  WORKSPACE               (default: /workspace)'; \
-echo '  SKIP_DRC                (set to 1 to skip KLayout DRC step)'; \
-echo '  CLAUDE_EFFORT           (Claude Code effort level, e.g. high/medium/low)'; \
-echo '  CODEX_EFFORT            (Codex effort level, e.g. high/medium/low)'; \
-echo ''"]
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/entrypoint-no-firewall.sh"]
+CMD ["sleep", "infinity"]

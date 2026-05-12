@@ -33,7 +33,7 @@
 # Usage:
 #   bash src/run_pipeline_claude.sh [--agent-only|--score-only] <info.json>
 #
-# Phase flags (detection tasks only):
+# Phase flags (apply to both detection and repair tasks):
 #   --agent-only   Run only prompt formatting and agent call (no scoring)
 #   --score-only   Run only scoring, CSV, and logging (agent must have run first)
 #
@@ -43,9 +43,12 @@
 
 set -euo pipefail
 
-# Compute workspace/src_dir early (needed for helper scripts)
+# Compute workspace + helper dir paths early (needed for helper scripts).
 workspace="${WORKSPACE:-/workspace}"
-src_dir="${workspace}/src"
+agent_dir="/workspace/agent"
+helpers_dir="${EVALUATOR_HELPERS_DIR:-/workspace/evaluator_helpers}"
+evaluator_dir="${EVALUATOR_DIR:-/workspace/evaluator}"
+backend="claude"
 
 # ---------------------------------------------------------------------------
 # 1. Parse arguments
@@ -61,6 +64,14 @@ while [[ "${1:-}" == --* ]]; do
     esac
 done
 
+# In --score-only mode, read helper scripts (parse_info_json,
+# postprocess_info_json, check_connectivity) from the manifest-verified
+# /workspace/evaluator/ bundle that the host injected after agent kill, not
+# from /workspace/evaluator_helpers/ which the agent may have tampered.
+if [[ "${phase}" == "score" && -d "${evaluator_dir}" ]]; then
+    helpers_dir="${evaluator_dir}"
+fi
+
 if [[ "$#" -ne 1 ]]; then
     echo "Usage: bash src/run_pipeline_claude.sh [--agent-only|--score-only] <info.json>" >&2
     exit 1
@@ -71,7 +82,7 @@ if [[ ! -f "${input_json}" ]]; then
     echo "Error: info.json not found: ${input_json}" >&2
     exit 1
 fi
-eval "$(python3 "${src_dir}/parse_info_json.py" "${input_json}")"
+eval "$(python3 "${helpers_dir}/parse_info_json.py" "${input_json}")"
 
 if [[ -z "${task_type}" || -z "${model_name}" || -z "${case_name}" || -z "${design_type}" ]]; then
     echo "Error: missing required fields (task_type, model_name, case_name, design_type)." >&2
@@ -88,11 +99,34 @@ if [[ "${design_type}" != "cell" && "${design_type}" != "polygon" && "${design_t
     exit 1
 fi
 
-# Phase flags only make sense for detection
-if [[ "${phase}" != "full" && "${task_type}" == "repair" ]]; then
-    echo "Error: --agent-only / --score-only flags are only supported for detection tasks." >&2
+# ---------------------------------------------------------------------------
+# Score-phase invariant
+# ---------------------------------------------------------------------------
+# 1. Hardened mode (HARDENED_EVALUATION=1 or SEALED_OUTPUT_SHA256 supplied)
+#    requires evaluator_dir == /workspace/evaluator AND that directory exists.
+# 2. agent phase reverse check: /workspace/evaluator must NOT exist before
+#    score phase (host-side bundle injection happens between phases).
+if [[ -n "${SEALED_OUTPUT_SHA256:-}" || "${HARDENED_EVALUATION:-0}" == "1" ]]; then
+    if [[ "${evaluator_dir}" != "/workspace/evaluator" ]]; then
+        echo "ERROR: HARDENED mode but EVALUATOR_DIR != /workspace/evaluator" >&2
+        exit 1
+    fi
+    if [[ ! -d "${evaluator_dir}" ]]; then
+        echo "ERROR: HARDENED mode but evaluator_dir missing: ${evaluator_dir}" >&2
+        exit 1
+    fi
+fi
+
+# Agent phase reverse check (evaluator bundle must not be visible yet)
+if [[ "${phase:-}" == "agent" && -d "/workspace/evaluator" ]]; then
+    echo "ERROR: /workspace/evaluator must NOT exist during agent phase" >&2
     exit 1
 fi
+
+# Belt-and-suspenders — even if docker exec did not
+# pass -e PYTHONDONTWRITEBYTECODE=1, exporting it here keeps Python from
+# writing .pyc into :ro mounted /workspace/agent.
+export PYTHONDONTWRITEBYTECODE=1
 
 # ---------------------------------------------------------------------------
 # 2. Paths setup
@@ -135,17 +169,22 @@ if [[ "${task_type}" == "repair" && -z "${golden_report}" ]]; then
     echo "WARNING: Golden DRC report not found for ${case_name}. Scoring may fail." >&2
 fi
 
-# Prompt template selection: design-type-specific for repair, generic for detection
-if [[ "${task_type}" == "repair" && -f "${src_dir}/prompt_repair_${design_type}.md" ]]; then
-    prompt_template="${src_dir}/prompt_repair_${design_type}.md"
-elif [[ -f "${src_dir}/prompt_${task_type}.md" ]]; then
-    prompt_template="${src_dir}/prompt_${task_type}.md"
+# Prompt template selection: design-type-specific for repair, generic for detection.
+# Fail-fast when neither design-specific nor generic
+# template exists, instead of silently passing a nonexistent path to
+# prompt_format.py (which would raise a traceback under set -euo).
+if [[ "${task_type}" == "repair" && -f "${agent_dir}/prompts/repair_${design_type}.json" ]]; then
+    prompt_template="${agent_dir}/prompts/repair_${design_type}.json"
+elif [[ -f "${agent_dir}/prompts/${task_type}.json" ]]; then
+    prompt_template="${agent_dir}/prompts/${task_type}.json"
 else
-    prompt_template="${src_dir}/prompt.md"
+    echo "ERROR: prompt template missing for task_type=${task_type} design_type=${design_type}" >&2
+    echo "       Looked for: ${agent_dir}/prompts/repair_${design_type}.json (repair) and ${agent_dir}/prompts/${task_type}.json" >&2
+    exit 1
 fi
 
 # Skill file for KLayout DRC
-skill_file="${src_dir}/skill.md"
+skill_file="${agent_dir}/skill.md"
 
 # DRC rule file (.lydrc for KLayout)
 if [[ "${design_type}" == "cell" ]]; then
@@ -155,9 +194,9 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 3. Agent script (Claude Code CLI)
+# 3. Agent dispatcher (unified)
 # ---------------------------------------------------------------------------
-AGENT_SCRIPT="${src_dir}/agent_claude.py"
+AGENT_SCRIPT="${agent_dir}/agent.py"
 
 echo "============================================="
 echo "  DRC Benchmark Pipeline (KLayout)"
@@ -179,7 +218,7 @@ write_score_csv() {
     local score_csv="$2"
     local case="$3"
 
-    python3 "${src_dir}/write_score_csv.py" "${score_json}" "${score_csv}" "${case}"
+    "${PY:-python3}" "${evaluator_dir}/write_score_csv.py" "${score_json}" "${score_csv}" "${case}"
 }
 
 # ---------------------------------------------------------------------------
@@ -207,7 +246,7 @@ mkdir -p "${task_dir}"
 case_info_json="${task_dir}/${case_name}_info.json"
 
 # Post-process the input JSON with container paths
-python3 "${src_dir}/postprocess_info_json.py" \
+python3 "${helpers_dir}/postprocess_info_json.py" \
     --input "${input_json}" \
     --output "${case_info_json}" \
     --skill_file "${skill_file}" \
@@ -222,7 +261,7 @@ python3 "${src_dir}/postprocess_info_json.py" \
 
 formatted_prompt_path="${task_dir}/${case_name}_${task_type}_prompt.md"
 
-python3 "${src_dir}/prompt_format.py" \
+python3 "${agent_dir}/prompt_format.py" \
     "${case_info_json}" \
     "${prompt_template}" \
     > "${formatted_prompt_path}"
@@ -243,32 +282,96 @@ tokens_json='{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_wr
 if [[ "${task_type}" == "repair" ]]; then
 
     # ===================================================================
-    # REPAIR: single agent call, no iteration loop
+    # REPAIR: split agent / score / full flow (mirrors detection)
     # ===================================================================
-    echo "[Step 2] Calling LLM agent (single call, no timeout)..."
+    meta_file="${result_dir}/.agent_meta.json"
 
-    agent_stderr_tmp="$(mktemp)"
-    python3 "${AGENT_SCRIPT}" \
-        "${formatted_prompt_path}" \
-        "${agent_output}" \
-        --model "${model_name}" \
-        --task_type "repair" \
-        --temp_dir "${temp_dir}" \
-        --fallback "${original_script}" \
-        --raw-json-out "${score_dir}/${case_name}_agent_raw.json" \
-        ${claude_effort:+--effort "${claude_effort}"} \
-        2>"${agent_stderr_tmp}" || true
-    cat "${agent_stderr_tmp}" >&2
+    if [[ "${phase}" != "score" ]]; then
+        # ----- Agent phase -----
+        echo "[Step 2] Calling LLM agent (single call, no timeout)..."
 
-    agent_status="$(grep -oP 'STATUS=\K(success|fail)' "${agent_stderr_tmp}" | tail -1 || echo fail)"
-    tokens_json="$(grep -oP 'TOKENS_JSON=\K.*' "${agent_stderr_tmp}" | tail -1 || echo '{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0}')"
-    agent_runtime_seconds="$(grep -oP 'RUNTIME_SECONDS=\K[0-9.]+' "${agent_stderr_tmp}" | tail -1 || echo 0)"
-    rm -f "${agent_stderr_tmp}"
+        agent_stderr_tmp="$(mktemp)"
+        python3 "${AGENT_SCRIPT}" \
+            --backend "${backend}" \
+            "${formatted_prompt_path}" \
+            "${agent_output}" \
+            --model "${model_name}" \
+            --task_type "repair" \
+            --workspace "${workspace}" \
+            --temp_dir "${temp_dir}" \
+            --fallback "${original_script}" \
+            --raw-json-out "${score_dir}/${case_name}_agent_raw.json" \
+            ${claude_effort:+--effort "${claude_effort}"} \
+            2>"${agent_stderr_tmp}" || true
+        cat "${agent_stderr_tmp}" >&2
 
-    echo "  Agent output  : ${agent_output}"
-    echo "  Agent status  : ${agent_status}"
-    echo "  Agent runtime : ${agent_runtime_seconds}s"
-    echo ""
+        # The host wrapper (evaluate_claude.sh) uses parse_agent_stderr +
+        # write_trusted_agent_meta after disconnect+kill to write sanitized
+        # trusted JSON into sealed_audit_dir, then docker cp into
+        # /workspace/temp/sealed/. The container side prefers the trusted
+        # meta; if missing, falls back to the original grep for
+        # standalone-debug compatibility.
+        agent_meta_path="/workspace/temp/sealed/${case_name}_agent_meta.json"
+        if [[ -f "${agent_meta_path}" ]]; then
+            agent_status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_status","fail"))' "${agent_meta_path}" 2>/dev/null || echo fail)"
+            agent_runtime_seconds="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_runtime_seconds",0))' "${agent_meta_path}" 2>/dev/null || echo 0)"
+            tokens_json="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("tokens",{})))' "${agent_meta_path}" 2>/dev/null || echo '{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0}')"
+        else
+            agent_status="$(grep -oP 'STATUS=\K(success|fail)' "${agent_stderr_tmp}" | tail -1 || echo fail)"
+            tokens_json="$(grep -oP 'TOKENS_JSON=\K.*' "${agent_stderr_tmp}" | tail -1 || echo '{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0}')"
+            agent_runtime_seconds="$(grep -oP 'RUNTIME_SECONDS=\K[0-9.]+' "${agent_stderr_tmp}" | tail -1 || echo 0)"
+        fi
+        rm -f "${agent_stderr_tmp}"
+
+        echo "  Agent output  : ${agent_output}"
+        echo "  Agent status  : ${agent_status}"
+        echo "  Agent runtime : ${agent_runtime_seconds}s"
+        echo ""
+
+        # Persist agent meta for --score-only phase
+        python3 -c 'import json,sys; d={"agent_status":sys.argv[1],"agent_runtime_seconds":float(sys.argv[2]),"tokens":json.loads(sys.argv[3])}; print(json.dumps(d))' \
+            "${agent_status}" "${agent_runtime_seconds}" "${tokens_json}" > "${meta_file}"
+    fi
+
+    if [[ "${phase}" == "agent" ]]; then
+        echo "  Agent-only phase complete."
+        [[ -d "${temp_dir}" ]] && rm -rf "${temp_dir}"
+        exit 0
+    fi
+
+    # ----- Score phase -----
+    # Score phase entry: switch to TRUSTED_PYTHON if injected.
+    PY="${TRUSTED_PYTHON:-python3}"
+    agent_meta_path="/workspace/temp/sealed/${case_name}_agent_meta.json"
+
+    # At score-phase entry, verify the evaluator
+    # manifest first. Invariant: when HARDENED_EVALUATION=1, missing
+    # manifest / hash mismatch / file-set mismatch all fail-closed exit 1. In
+    # legacy mode, missing manifest is only a WARN.
+    if [[ "${HARDENED_EVALUATION:-0}" == "1" ]]; then
+        bash "${evaluator_dir}/verify_evaluator_bundle.sh" || {
+            echo "ERROR: evaluator manifest verify failed" >&2
+            exit 1
+        }
+    fi
+
+    # Recover meta for score-only mode
+    if [[ -f "${meta_file}" ]]; then
+        agent_status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_status"])' "${meta_file}")"
+        agent_runtime_seconds="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1]))["agent_runtime_seconds"])' "${meta_file}")"
+        tokens_json="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1]))["tokens"]))' "${meta_file}")"
+    fi
+
+    # Re-locate golden report (may have been injected after agent phase)
+    if [[ -z "${golden_report}" || ! -f "${golden_report}" ]]; then
+        golden_json="${case_testcase_dir}/drc_report/${case_name}.drc.json"
+        golden_lyrpt="${case_testcase_dir}/drc_report/${case_name}.lyrpt"
+        if [[ -f "${golden_json}" ]]; then
+            golden_report="${golden_json}"
+        elif [[ -f "${golden_lyrpt}" ]]; then
+            golden_report="${golden_lyrpt}"
+        fi
+    fi
 
     # --- Render GDS ---
     echo "[Step 3] Rendering GDS..."
@@ -277,16 +380,16 @@ if [[ "${task_type}" == "repair" ]]; then
     lyrpt_path="${temp_dir}/${case_name}.lyrpt"
     drc_json_path="${temp_dir}/${case_name}.drc.json"
 
-    python3 "${src_dir}/prepare_render_script.py" \
+    "${PY}" "${evaluator_dir}/prepare_render_script.py" \
         "${agent_output}" "${render_script}" "${gds_path}"
     klayout -b -r "${render_script}" || echo "WARNING: KLayout render failed."
 
     # --- KLayout DRC ---
     if [[ "${SKIP_DRC:-0}" != "1" ]]; then
         echo "[Step 4] Running KLayout DRC..."
-        python3 "${src_dir}/run_klayout_drc.py" "${gds_path}" "${design_rule}" "${lyrpt_path}" || true
+        "${PY}" "${evaluator_dir}/run_klayout_drc.py" "${gds_path}" "${design_rule}" "${lyrpt_path}" || true
         if [[ -f "${lyrpt_path}" ]]; then
-            python3 "${src_dir}/process_klayout_reports.py" \
+            "${PY}" "${evaluator_dir}/process_klayout_reports.py" \
                 --lyrpt "${lyrpt_path}" \
                 --output "${drc_json_path}" \
                 --case_name "${case_name}" \
@@ -298,9 +401,9 @@ if [[ "${task_type}" == "repair" ]]; then
     # --- Sanity + Connectivity checks ---
     sanity_json_path="${temp_dir}/${case_name}_sanity.json"
     connectivity_json=""
-    if [[ -f "${src_dir}/sanity_check.py" ]]; then
+    if [[ -f "${evaluator_dir}/sanity_check.py" ]]; then
         echo "[Step 5] Running sanity check..."
-        klayout -b -r "${src_dir}/sanity_check.py" \
+        klayout -b -r "${evaluator_dir}/sanity_check.py" \
             -rd "original_gds_path=${case_testcase_dir}/gds/${case_name}.gds" \
             -rd "modified_gds_path=${gds_path}" \
             -rd "original_script_path=${original_script}" \
@@ -315,7 +418,7 @@ if [[ "${task_type}" == "repair" ]]; then
         golden_conn_json="${original_script/\/layout_script\//\/connectivity\/}"
         golden_conn_json="${golden_conn_json%.py}.json"
         connectivity_json="${temp_dir}/${case_name}_connectivity.json"
-        python3 "${src_dir}/check_connectivity.py" \
+        "${PY}" "${helpers_dir}/check_connectivity.py" \
             "${golden_conn_json}" "${agent_output}" "${design_type}" \
             > "${connectivity_json}" || true
     fi
@@ -331,23 +434,53 @@ if [[ "${task_type}" == "repair" ]]; then
         repaired_arg=""
     fi
 
-    python3 "${src_dir}/score_repair.py" \
-        "${golden_report}" \
-        "${repaired_arg}" \
-        --agent-status "${agent_status}" \
-        --tokens-json "${tokens_json}" \
-        --agent-runtime-seconds "${agent_runtime_seconds}" \
-        > "${score_json}"
+    # agent_meta fail-closed guard (symmetric with the
+    # detection-side guard above). score_repair.py requires --agent-meta
+    # and unconditionally opens it; if the trusted meta failed to inject
+    # or agent_status is not success, write a null score JSON + CSV and
+    # skip the scorer rather than crashing the whole pipeline.
+    if [[ ! -f "${agent_meta_path}" ]]; then
+        echo "agent_meta missing at ${agent_meta_path}; emitting fail-closed null repair score." >&2
+        score_csv="${score_dir}/${case_name}_score.csv"
+        "${PY}" "${evaluator_dir}/write_invalid_score.py" \
+            --output "${score_json}" \
+            --task "${task_type}" \
+            --invalid-reason "agent_meta_missing" \
+            --null-metrics --null-tokens || true
+        "${PY}" "${evaluator_dir}/write_score_csv.py" \
+            "${score_json}" "${score_csv}" "${case_name}" || true
+        exit 0
+    fi
+    _agent_status_from_meta="$("${PY}" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_status","fail"))' "${agent_meta_path}" 2>/dev/null || echo fail)"
+    if [[ "${_agent_status_from_meta}" != "success" ]]; then
+        echo "agent_status=${_agent_status_from_meta}; emitting fail-closed null repair score." >&2
+        score_csv="${score_dir}/${case_name}_score.csv"
+        "${PY}" "${evaluator_dir}/write_invalid_score.py" \
+            --output "${score_json}" \
+            --task "${task_type}" \
+            --invalid-reason "agent_failed" \
+            --null-metrics --null-tokens \
+            --agent-meta "${agent_meta_path}" || true
+        "${PY}" "${evaluator_dir}/write_score_csv.py" \
+            "${score_json}" "${score_csv}" "${case_name}" || true
+        exit 0
+    fi
+
+    "${PY}" "${evaluator_dir}/score_repair.py" \
+        --original-drc "${golden_report}" \
+        --new-drc "${repaired_arg}" \
+        --output "${score_json}" \
+        --agent-meta "${agent_meta_path}"
 
     # --- Merge check results into score ---
     if [[ -f "${sanity_json_path}" ]]; then
         echo "[Step 6.5] Merging sanity check into score..."
-        python3 "${src_dir}/merge_score_sanity.py" \
+        "${PY}" "${evaluator_dir}/merge_score_sanity.py" \
             "${score_json}" "${sanity_json_path}" || true
     fi
     if [[ -n "${connectivity_json}" && -f "${connectivity_json}" ]]; then
         echo "[Step 6.5] Merging connectivity into score..."
-        python3 "${src_dir}/merge_score_connectivity.py" \
+        "${PY}" "${evaluator_dir}/merge_score_connectivity.py" \
             "${score_json}" "${connectivity_json}" || true
     fi
 
@@ -368,19 +501,33 @@ else
 
         agent_stderr_tmp="$(mktemp)"
         python3 "${AGENT_SCRIPT}" \
+            --backend "${backend}" \
             "${formatted_prompt_path}" \
             "${agent_output}" \
             --model "${model_name}" \
             --task_type "detection" \
+            --workspace "${workspace}" \
             --temp_dir "${temp_dir}" \
             --raw-json-out "${score_dir}/${case_name}_agent_raw.json" \
             ${claude_effort:+--effort "${claude_effort}"} \
             2>"${agent_stderr_tmp}" || true
         cat "${agent_stderr_tmp}" >&2
 
-        agent_status="$(grep -oP 'STATUS=\K(success|fail)' "${agent_stderr_tmp}" | tail -1 || echo fail)"
-        tokens_json="$(grep -oP 'TOKENS_JSON=\K.*' "${agent_stderr_tmp}" | tail -1 || echo '{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0}')"
-        agent_runtime_seconds="$(grep -oP 'RUNTIME_SECONDS=\K[0-9.]+' "${agent_stderr_tmp}" | tail -1 || echo 0)"
+        # Replaces in-container stderr grep. The host wrapper
+        # has already docker cp'd a trusted JSON into
+        # /workspace/temp/sealed/${case_name}_agent_meta.json after
+        # disconnect+kill; the container side prefers the trusted meta and
+        # falls back to the original grep for standalone-debug compatibility.
+        agent_meta_path="/workspace/temp/sealed/${case_name}_agent_meta.json"
+        if [[ -f "${agent_meta_path}" ]]; then
+            agent_status="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_status","fail"))' "${agent_meta_path}" 2>/dev/null || echo fail)"
+            agent_runtime_seconds="$(python3 -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_runtime_seconds",0))' "${agent_meta_path}" 2>/dev/null || echo 0)"
+            tokens_json="$(python3 -c 'import json,sys; print(json.dumps(json.load(open(sys.argv[1])).get("tokens",{})))' "${agent_meta_path}" 2>/dev/null || echo '{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0}')"
+        else
+            agent_status="$(grep -oP 'STATUS=\K(success|fail)' "${agent_stderr_tmp}" | tail -1 || echo fail)"
+            tokens_json="$(grep -oP 'TOKENS_JSON=\K.*' "${agent_stderr_tmp}" | tail -1 || echo '{"input_tokens":0,"output_tokens":0,"cache_read_tokens":0,"cache_write_tokens":0}')"
+            agent_runtime_seconds="$(grep -oP 'RUNTIME_SECONDS=\K[0-9.]+' "${agent_stderr_tmp}" | tail -1 || echo 0)"
+        fi
         rm -f "${agent_stderr_tmp}"
 
         echo "  Agent output  : ${agent_output}"
@@ -400,6 +547,44 @@ else
     fi
 
     # ----- Score phase -----
+    # Score phase entry: switch to TRUSTED_PYTHON if injected.
+    PY="${TRUSTED_PYTHON:-python3}"
+
+    # At score-phase entry, verify the evaluator
+    # manifest first. Invariant: when HARDENED_EVALUATION=1, missing
+    # manifest / hash mismatch / file-set mismatch all fail-closed exit 1. In
+    # legacy mode, missing manifest is only a WARN.
+    if [[ "${HARDENED_EVALUATION:-0}" == "1" ]]; then
+        bash "${evaluator_dir}/verify_evaluator_bundle.sh" || {
+            echo "ERROR: evaluator manifest verify failed" >&2
+            exit 1
+        }
+    fi
+
+    # When agent fails, fail-closed by writing null
+    # metrics + null tokens score JSON / CSV, to prevent downstream
+    # score_detection.py from trying to parse an empty file. trusted meta is
+    # docker cp'd in by the host wrapper; missing file or agent_status !=
+    # success is treated as agent_failed.
+    agent_meta_path="/workspace/temp/sealed/${case_name}_agent_meta.json"
+    if [[ -f "${agent_meta_path}" ]]; then
+        _agent_status_from_meta="$("${PY}" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_status","fail"))' "${agent_meta_path}" 2>/dev/null || echo fail)"
+        if [[ "${_agent_status_from_meta}" != "success" ]]; then
+            echo "agent_status=${_agent_status_from_meta}; emitting fail-closed null score." >&2
+            mkdir -p "${score_dir}"
+            score_json="${score_dir}/${case_name}_score.json"
+            score_csv="${score_dir}/${case_name}_score.csv"
+            "${PY}" "${evaluator_dir}/write_invalid_score.py" \
+                --output "${score_json}" \
+                --task "${task_type}" \
+                --invalid-reason "agent_failed" \
+                --null-metrics --null-tokens \
+                --agent-meta "${agent_meta_path}" || true
+            "${PY}" "${evaluator_dir}/write_score_csv.py" \
+                "${score_json}" "${score_csv}" "${case_name}" || true
+            exit 0
+        fi
+    fi
 
     # Re-locate golden report (may have been injected after agent phase)
     if [[ -z "${golden_report}" || ! -f "${golden_report}" ]]; then
@@ -427,13 +612,11 @@ else
     echo "[Step 3] Scoring detection results..."
     score_json="${score_dir}/${case_name}_score.json"
 
-    python3 "${src_dir}/score_detection.py" \
-        "${agent_output}" \
-        "${golden_report}" \
-        --agent-status "${agent_status}" \
-        --tokens-json "${tokens_json}" \
-        --agent-runtime-seconds "${agent_runtime_seconds}" \
-        > "${score_json}"
+    "${PY}" "${evaluator_dir}/score_detection.py" \
+        --predicted "${agent_output}" \
+        --golden "${golden_report}" \
+        --output "${score_json}" \
+        --agent-meta "${agent_meta_path}"
 
     score_csv="${score_dir}/${case_name}_score.csv"
     write_score_csv "${score_json}" "${score_csv}" "${case_name}"
@@ -448,7 +631,7 @@ mkdir -p "${log_dir}"
 runtime_csv="${log_dir}/runtime.csv"
 timestamp_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
-python3 "${src_dir}/log_runtime.py" \
+"${PY:-python3}" "${evaluator_dir}/log_runtime.py" \
     "${runtime_csv}" \
     "${model_name}" "${claude_effort}" "${task_type}" "${design_type}" "${case_name}" \
     "${agent_status}" \
