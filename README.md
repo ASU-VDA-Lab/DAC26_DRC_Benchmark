@@ -112,7 +112,7 @@ TASK=repair                  # must match task_type inside $INFO_JSON
 PIPELINE=run_pipeline_claude.sh
 AUTH_HOST="$HOME/.claude/.credentials.json"
 AUTH_CONT="/root/.claude/.credentials.json"
-EFFORT_ENV=(-e CLAUDE_EFFORT=high)              # used by BOTH agent and score phases
+EFFORT_ENV=(-e CLAUDE_EFFORT=medium)              # used by BOTH agent and score phases
 AGENT_EXTRA_ENV=(-e CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000)  # agent phase ONLY (Claude-specific)
 IMAGE="drc-benchmark-${TASK}"           # repair -> -repair, detection -> -detection
 NET_FLAG=(); [[ "$TASK" == "detection" ]] && NET_FLAG=(--cap-add=NET_ADMIN)
