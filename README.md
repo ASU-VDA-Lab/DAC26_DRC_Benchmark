@@ -1,139 +1,66 @@
 # DAC 2026 DRC Benchmark
 
-![Benchmarks](etc/benchmarks.png)
+Benchmark for evaluating LLMs on ASAP7 KLayout DRC repair and detection inside a self-contained Docker container.
 
-A benchmark framework for evaluating LLM models on chip physical design tasks -- specifically **DRC repair** and **DRC detection** -- using the ASAP7 7nm PDK and KLayout DRC.
+## Modification policy
 
-This benchmark runs inside a self-contained Docker container. KLayout 0.30.1 and the Cursor / Claude Code / Codex CLIs are pre-installed in the image. No host KLayout installation or commercial EDA licenses are required.
+**Only `agent/` is user-modifiable.** Everything else (scoring code, orchestration, Docker hardening, test cases, helper scripts) is part of the frozen benchmark infrastructure; modifying it invalidates the result for cross-submission comparison.
 
-Shortcut: [Table of Contents](#table-of-contents) | [Benchmark Tasks](#benchmark-tasks) | [Quick Start](#quick-start) | [Pipeline Architecture](#pipeline-architecture) | [Detection Isolation](#detection-isolation) | [Scoring Methodology](#scoring-methodology) | [Results](#results) | [Processed DRC Reports](#processed-drc-reports) | [Detection Output Format](#detection-output-format) | [Score Output](#score-output) | [Design Types](#design-types) 
+| Directory | User may modify? | Purpose |
+|---|---|---|
+| `agent/` | ✅ **Yes** | Your contribution: dispatcher, backend adapters, prompt templates, `skill.md`. |
+| `evaluator/` | ❌ No | Trusted scoring / render / DRC bundle. Hash-verified at score-phase entry. |
+| `src/` | ❌ No | Pipeline orchestration (`run_pipeline_*.sh`, `evaluate_*.sh`, `lib_helpers.sh`). |
+| `testcase/` | ❌ No | Frozen ASAP7 benchmark cases (594 total). |
+| `docker/`, `Dockerfile.*`, `scripts/` | ❌ No | Container hardening + one-time setup. |
+| `result/`, `score/`, `task/`, `temp/`, `logs/` | n/a | Runtime artifacts; auto-created and overwritten per run. |
 
----
+**Building a custom agent?** See [`CUSTOM_AGENT.md`](./CUSTOM_AGENT.md) for the full contract: required filenames, CLI arguments your `agent.py` must accept, the stderr markers it must emit, the info.json fields available to your prompt template, and a minimum-viable skeleton.
 
-## Table of Contents
+## Quick reference
 
-- *[Dockerfile.repair](./Dockerfile.repair)*: Repair-task image (AlmaLinux 8.10 + KLayout 0.30.1 + Cursor Agent CLI + Claude Code CLI + Codex CLI).
-- *[Dockerfile.detection](./Dockerfile.detection)*: Detection-task image (Cursor Agent CLI + Claude Code CLI + Codex CLI) -- no KLayout, runtime iptables blocklist on klayout/package-index domains to prevent the agent from invoking or installing DRC tools.
-- *[CLAUDE.md](./CLAUDE.md)*: Agent behavior contract read by the LLM inside the container (unattended-Docker rules: never ask, never wait, never abort).
-- *[docker/](./docker)*: Build-time helpers for the detection image (`entrypoint-blocklist.sh`).
-- *[case_stat.md](./case_stat.md)*: Test case statistics -- polygon target rules, block design details, and cell DRC violations.
-- *[example/](./example)*: Customizable files -- modify here and copy to *[src/](./src)* to use.
-- *[src/](./src)*: Pipeline source code and agent scripts (incl. `skill.md`, the ASAP7 DRC reference fed to agents via `path_to_skill`).
-- *[testcase/](./testcase)*: Test case assets and ASAP7 technology files.
-- *[result/](./result)*: LLM outputs, stored at `result/<model_name>/<design_type>/<task_type>/<case_name>/` (auto-created on first run).
-- *[score/](./score)*: Evaluation scores, stored at `score/<model_name>/<design_type>/<task_type>/` (auto-created on first run).
-- *[task/](./task)*: Formatted prompts (auto-created on first run).
-- *[temp/](./temp)*: Intermediate/scratch files written by LLM agents; cleaned up after each run (auto-created on first run).
-- *[logs/](./logs)*: Full pipeline console logs (`<model>_<design>_<task>_<case>.log`) and `runtime.csv` (auto-created on first run).
+- `Dockerfile.repair` — repair-task image (AlmaLinux 8.10 + KLayout 0.30.1 + Cursor / Claude Code / Codex CLIs).
+- `Dockerfile.detection` — detection-task image; ships without KLayout, with iptables blocklist on klayout / package-index domains so the agent cannot recover the golden DRC answer.
+- `docker/` — entrypoint helpers (firewall + blocklist).
+- `src/` — pipeline orchestration scripts (`run_pipeline_*.sh`, `evaluate_*.sh`, `lib_helpers.sh`, `build_case_info.py`). See [`src/README.md`](./src/README.md).
+- `agent/` — unified LLM agent layer (`agent.py` dispatcher, prompt JSON templates, `skill.md`, backends). See [`agent/README.md`](./agent/README.md).
+- `evaluator/` — trusted score-phase bundle (DRC runner, scorers, sanity / connectivity, manifest, `trusted_bin/`). See [`evaluator/README.md`](./evaluator/README.md).
+- `testcase/` — ASAP7 PDK + 594 cases (`cell` 255 / `polygon` 332 / `block` 7). See [`testcase/README.md`](./testcase/README.md).
+- `scripts/` — one-time setup (`build_trusted_bin.sh`, `build_seccomp_profile.sh`).
+- `result/`, `score/`, `task/`, `temp/`, `logs/` — runtime I/O (auto-created).
 
----
-
-## Benchmark Tasks
-
-### Task 1: DRC Repair
-
-The LLM agent receives a layout (GDS, layout script, screenshot) along with its KLayout DRC report and the ASAP7 design rule documentation. It must produce a **modified layout script** that resolves all reported violations without introducing new ones or corrupting the design.
-
-**Inputs provided to the agent:**
-
-
-| Input                       | Description                                                                |
-| --------------------------- | -------------------------------------------------------------------------- |
-| Layout script (`.py`)       | KLayout Python (`pya` API) script that generates the GDS                   |
-| GDS file (`.gds`)           | Compiled GDS-II binary layout                                              |
-| Layout screenshot (`.png`)  | Visual rendering of the layout                                             |
-| DRC report (`.drc.json`)    | Processed DRC report in structured JSON with violation counts and geometry |
-| Design rule file (`.lydrc`) | KLayout DRC rule file defining every design rule                           |
-| Skill document (`skill.md`) | ASAP7 DRC knowledge reference for LLM agents                               |
-| Connectivity JSON (`.json`) | Golden connectivity reference (cell/block only); the agent uses this with `check_connectivity.py` to verify electrical connections are preserved |
-
-
-**Expected output:** The agent saves a modified KLayout Python layout script directly to `result/<model_name>/<design_type>/repair/<case_name>/<case_name>_repaired.py`.
-
-**Evaluation flow:**
-
-1. LLM's modified script is executed via KLayout to produce a new GDS
-2. KLayout DRC is re-run on the new GDS
-3. Repaired DRC results are converted to `.drc.json` for consistent comparison
-4. Sanity check validates GDS integrity (top cell, layers, cell structure; for polygon designs, also verifies shape count per layer is unchanged)
-5. Connectivity check verifies electrical connections are preserved (cell/block only)
-6. Golden `.drc.json` and repaired `.drc.json` are compared to compute scoring metrics
-
-### Task 2: DRC Detection
-
-The LLM agent receives the same layout inputs **except** the DRC report. It must predict which rules are violated, estimate the violation count for each, and provide **DRV (Design Rule Violation) regions** for every violation instance.
-
-**DRV region format:**
-
-- **Spacing violations** (`.S.` rules): **edge pair** -- the two edges that are too close, each as `[x1, y1, x2, y2]` in dbu (integer database units; 1 dbu = 0.00025 um)
-- **All other violations**: **bounding box** -- `[xmin, ymin, xmax, ymax]` in dbu (integer database units; 1 dbu = 0.00025 um)
-
-**Expected output:** The agent saves a JSON array of predicted violations directly to `result/<model_name>/<design_type>/detection/<case_name>/<case_name>_detection.json`:
-
-```json
-[
-  {
-    "rule_name": "M1.S.4",
-    "violation_count": 1,
-    "violations": [
-      {"type": "edge_pair", "edge1": [0, 200, 80, 200], "edge2": [0, 312, 80, 312]}
-    ]
-  },
-  {
-    "rule_name": "ACTIVE.A.1A",
-    "violation_count": 1,
-    "violations": [
-      {"type": "bbox", "bbox": [0, 0, 270, 270]}
-    ]
-  }
-]
-```
-
-**Evaluation flow:**
-
-1. LLM's detection JSON is parsed (including DRV regions)
-2. Golden `.drc.json` report is parsed (contains both violation counts and per-violation geometry)
-3. Predicted violations are matched to golden violations using **geometry-based matching**:
-  - **Polygon** golden bbox (non-zero area): overlap + area ratio within `[0.81, 1.21]` (linear ±10% squared)
-  - **Edge** golden bbox (degenerate line, one dim = 0): both edge endpoints lie inside the predicted bbox AND the predicted bbox's longest side must not exceed `edge_length × 1.1`
-  - Both criteria must be met for a match
-4. TP (matched), FP (unmatched predicted), FN (unmatched golden) are computed per rule
-5. Aggregate and per-rule precision/recall/F1 metrics are calculated
-
----
-
-## Quick Start
+## Quick start
 
 ### Prerequisites
 
-- **Docker** -- for building and running the benchmark container
-- **Cursor CLI on the host** (for Cursor pipeline) -- install and log in:
+- **Docker** — for building and running the benchmark container.
+- **Cursor CLI on the host** (for Cursor pipeline) — install and log in:
   ```bash
   curl https://cursor.com/install -fsS | bash
   agent login
   ```
   The login credentials at `~/.config/cursor/auth.json` are bind-mounted (read-only) into the container at runtime.
-- **Claude Code CLI on the host** (for Claude Code pipeline) -- install and log in:
+- **Claude Code CLI on the host** (for Claude Code pipeline) — install and log in:
   ```bash
   curl -fsSL https://claude.ai/install.sh | bash
   claude login
   ```
   The login credentials at `~/.claude/` are bind-mounted (read-only) into the container at runtime.
-- **Codex CLI on the host** (for Codex pipeline) -- install and log in:
+- **Codex CLI on the host** (for Codex pipeline) — install and log in:
   ```bash
   npm install -g @openai/codex@0.124.0
   codex login
   ```
   The login credentials at `~/.codex/auth.json` are bind-mounted (read-only) into the container at runtime.
-- **KLayout 0.30.1** -- pre-installed in the Docker image (downloaded from klayout.org during build)
-- **Python 3.6+** -- pre-installed in the Docker image (standard library only; no extra pip packages required)
+- **KLayout 0.30.1** — pre-installed in the Docker image (downloaded from klayout.org during build).
+- **Python 3.6+** — pre-installed in the Docker image (standard library only; no extra pip packages required).
 
-### 1. Build the Docker Images
+### 1. Build the Docker images
 
 Two images are used:
 
-- `drc-benchmark-repair` (full KLayout) -- for repair tasks, which legitimately need to run DRC.
-- `drc-benchmark-detection` (no KLayout, with iptables blocklist on klayout/package-index domains) -- for detection tasks, to prevent the agent from leaking the golden DRC answer by invoking or installing KLayout.
+- `drc-benchmark-repair` (full KLayout) — for repair tasks, which legitimately need to run DRC.
+- `drc-benchmark-detection` (no KLayout, with iptables blocklist on klayout / package-index domains) — for detection tasks, to prevent the agent from leaking the golden DRC answer by invoking or installing KLayout.
 
 ```bash
 cd DAC26_DRC_Benchmark/
@@ -141,15 +68,13 @@ docker build -f Dockerfile.repair    -t drc-benchmark-repair    .
 docker build -f Dockerfile.detection -t drc-benchmark-detection .
 ```
 
-Both images are AlmaLinux 8.10 with Cursor CLI + Claude Code CLI + Codex CLI pre-installed. The repair image additionally has KLayout 0.30.1, Ruby, and Qt5. The detection image has Python 3.6 and `iptables` only; download tools (`wget`, `curl`, `pip`, `yum`, `rpm`, `gcc`, `git`, `npm`, etc.) are stripped, and the entrypoint installs a runtime blocklist of klayout.org, pypi.org, github.com, etc. See [Detection Isolation](#detection-isolation) below.
+Both images are AlmaLinux 8.10 with Cursor CLI + Claude Code CLI + Codex CLI pre-installed. The repair image additionally has KLayout 0.30.1, Ruby, and Qt5. The detection image has Python 3.6 and `iptables` only; download tools (`wget`, `curl`, `pip`, `yum`, `rpm`, `gcc`, `git`, `npm`, etc.) are stripped, and the entrypoint installs a runtime blocklist of klayout.org, pypi.org, github.com, etc.
 
-### 2. Run a Single Test Case
+### 2. Run a single test case
 
-**All commands must be run from the `DAC26_DRC_Benchmark/` directory.** To run a single case, prepare an `info.json` (see `example/info.json` for the required keys) and call the pipeline script inside the Docker container. Note: `output_path` and `temp_dir` are automatically overwritten by the pipeline with computed container paths -- you can leave them empty or set them to any placeholder value.
+All commands must be run from the `DAC26_DRC_Benchmark/` directory. To run a single case, prepare an `info.json` (see [`agent/README.md`](./agent/README.md) for the required keys) and call the pipeline script inside the Docker container. `output_path` and `temp_dir` are automatically overwritten by the pipeline with computed container paths — you can leave them empty or set them to any placeholder value.
 
-Use `drc-benchmark-repair` for repair tasks and `drc-benchmark-detection` for detection tasks. Detection additionally requires `--cap-add=NET_ADMIN` so the container entrypoint can program its iptables blocklist.
-
-Both examples mirror what `evaluate_cursor.sh` / `evaluate_claude.sh` / `evaluate_codex.sh` do per case: bind-mount only the single credential file (not the whole credential directory), bind-mount the four runtime I/O directories (`result`, `score`, `logs`, `temp`), and inject the golden DRC report via `docker cp` rather than a volume mount so detection runs never see it on the filesystem before the scoring phase. **For Codex, `CODEX_EFFORT` is required** (e.g. `high` / `medium` / `low`) and is passed via `docker exec -e CODEX_EFFORT=...`.
+Use `drc-benchmark-repair` for repair tasks and `drc-benchmark-detection` for detection tasks. Detection additionally requires `--cap-add=NET_ADMIN` so the container entrypoint can program its iptables blocklist. For Codex, `CODEX_EFFORT` is required (e.g. `high` / `medium` / `low`) and is passed via `docker exec -e CODEX_EFFORT=...`.
 
 **Cursor Agent CLI (repair example):**
 
@@ -199,14 +124,17 @@ docker start "$CONTAINER"
 
 docker cp info.json "$CONTAINER:/workspace/task/info.json"
 
-# Phase 1: agent-only (golden report NOT yet in container)
-docker exec "$CONTAINER" bash src/run_pipeline_claude.sh --agent-only /workspace/task/info.json
+# Phase 1: agent-only (golden report NOT yet in container).
+# CLAUDE_EFFORT is required by run_pipeline_claude.sh (see src/README.md).
+docker exec -e CLAUDE_EFFORT=high "$CONTAINER" \
+    bash src/run_pipeline_claude.sh --agent-only /workspace/task/info.json
 
-# Phase 2: inject golden report, then score
+# Phase 2: inject golden report, then score.
 docker exec "$CONTAINER" mkdir -p "/workspace/testcase/asap7/$DESIGN/drc_report"
 docker cp "testcase/asap7/$DESIGN/drc_report/$CASE.drc.json" \
     "$CONTAINER:/workspace/testcase/asap7/$DESIGN/drc_report/"
-docker exec "$CONTAINER" bash src/run_pipeline_claude.sh --score-only /workspace/task/info.json
+docker exec -e CLAUDE_EFFORT=high "$CONTAINER" \
+    bash src/run_pipeline_claude.sh --score-only /workspace/task/info.json
 
 docker rm -f "$CONTAINER"
 ```
@@ -243,180 +171,60 @@ docker rm -f "$CONTAINER"
 
 For Codex detection runs, use `drc-benchmark-detection` with `--cap-add=NET_ADMIN` and the same `--agent-only` / `--score-only` two-phase flow shown above for Claude.
 
-The `--agent-only` / `--score-only` phase flags exist exactly to gate when the golden DRC report becomes visible to the agent (see [Pipeline Architecture](#pipeline-architecture)).
+### 3. Reproduce paper experiments
 
-### 3. Reproduce Paper Experiments
-
-`evaluate_cursor.sh` (Cursor), `evaluate_claude.sh` (Claude Code), and `evaluate_codex.sh` (Codex) are provided to reproduce the experiments in the paper. They automate info.json generation, Docker container lifecycle, and golden DRC report injection across all task/model/case combinations. Most users do not need these scripts.
+`evaluate_cursor.sh` (Cursor), `evaluate_claude.sh` (Claude Code), and `evaluate_codex.sh` (Codex) reproduce the experiments in the paper. They automate `info.json` generation, Docker container lifecycle, and golden DRC report injection across all task / model / case combinations. Edit the `CASES` array in the script to control which cases are swept.
 
 ```bash
-# Edit the CASES array, then run:
 bash src/evaluate_cursor.sh          # Cursor Agent CLI
 bash src/evaluate_claude.sh          # Claude Code CLI
 bash src/evaluate_codex.sh           # Codex CLI
 ```
 
----
-
-## Pipeline Architecture
-
-The core pipeline runs inside a Docker container via `run_pipeline_cursor.sh` (Cursor), `run_pipeline_claude.sh` (Claude Code), or `run_pipeline_codex.sh` (Codex). For paper experiments, `evaluate_cursor.sh` / `evaluate_claude.sh` / `evaluate_codex.sh` wrap this with automated info.json generation and Docker container management:
+## Pipeline architecture
 
 ```
-evaluate_{cursor,claude,codex}.sh (paper experiments only)              [HOST]
-  |
-  +-- For each task_type × model_name × case:
-  |     +-- Generate info.json (build_case_info.py)
-  |     +-- Create Docker container
-  |     +-- Copy info.json into container
-  |     +-- [Repair]: copy golden DRC report, run full pipeline
-  |     +-- [Detection]: run agent-only, copy golden DRC report, run score-only
-  |     +-- Clean up container
+host (evaluate_*.sh)
+  -> docker create + cp info.json
+  -> agent phase   : run_pipeline_*.sh -> agent/agent.py --backend <b>
+                     (evaluator/ NOT mounted; iptables blocklist active for detection)
+  -> kill leftover, network disconnect, docker cp evaluator/. + trusted_bin
+  -> score phase   : verify_evaluator_bundle (sha256 manifest)
+                     -> render (repair) -> KLayout DRC -> sanity / connectivity
+                     -> score_repair.py | score_detection.py -> CSV + runtime.csv
 ```
 
-Inside the container, `run_pipeline_{cursor,claude,codex}.sh` executes:
+Step-level details live in [`src/README.md`](./src/README.md); trusted-bundle internals in [`evaluator/README.md`](./evaluator/README.md).
 
-```
-run_pipeline_{cursor,claude,codex}.sh <info.json>                       [CONTAINER]
-  |
-  +-- Step 1: Post-process info.json (rewrite paths to container perspective)
-  +-- Step 2: Format prompt (prompt_format.py + prompt_repair/detection.md)
-  +-- Step 3: Call LLM model once (agent_cursor.py, agent_claude.py, or agent_codex.py)
-  |            The agent runs to completion; no timeout, no reminder.
-  |            The wrapper parses CLI JSON output for token usage and
-  |            emits STATUS, TOKENS_JSON, and RUNTIME_SECONDS on stderr.
-  |
-  +-- [Repair only]:
-  |    +-- Step 3.5: Render GDS (KLayout batch mode)
-  |    +-- Step 4:   Run KLayout DRC -> .lyrpt -> .drc.json
-  |    +-- Step 5:   Sanity check
-  |    +-- Step 5.5: Connectivity check (cell/block only)
-  |
-  +-- Step 6: Score (score_repair.py or score_detection.py) -- also writes
-              agent_status, runtime_seconds, and the 4 token fields into
-              the score JSON.
-  +-- Write CSV (write_score_csv.py)
-  +-- Append runtime row to logs/runtime.csv (log_runtime.py)
-```
+## Trust boundary index
 
-Each agent call is a **single invocation** that runs to natural completion; token usage is captured from the CLI JSON output.
+- Agent phase and score phase are strictly separated; the agent never sees `/workspace/evaluator/`.
+- `Dockerfile.detection` ships without KLayout / wget / curl / pip / yum / git; entrypoint installs an iptables OUTPUT REJECT list on klayout.org / pypi.org / github.com / etc., then drops `NET_ADMIN` from the bounding set.
+- All score-phase `docker exec` calls go through `secured-exec.sh` with `HARDENED_EVALUATION=1` and `EVALUATOR_DIR=/workspace/evaluator`.
+- `evaluator.sha256` manifest is verified by `verify_evaluator_bundle` as the first step of the score phase (fail-closed).
+- `evaluator/trusted_bin/{bash,python3,sha256sum}` are re-injected over `*-trusted` paths after agent kill, so a tampered `/bin/bash` cannot subvert manifest verification.
 
-### Supported Models
+Full definitions and injection sequence: [`evaluator/README.md`](./evaluator/README.md). Agent-side contract: [`agent/README.md`](./agent/README.md).
 
-Models are invoked via the Cursor Agent CLI (`src/agent_cursor.py`), the Claude Code CLI (`src/agent_claude.py`), or the Codex CLI (`src/agent_codex.py`). The 6 default benchmark models (Cursor model names) are:
+## Scoring
 
+Repair metrics (golden `.drc.json` vs repaired `.drc.json` from re-running KLayout):
 
-| Default Model              | Provider  | Description                |
-| -------------------------- | --------- | -------------------------- |
-| `gpt-5.4-high`             | OpenAI    | GPT-5.4 (high reasoning)   |
-| `claude-4.6-opus-high`     | Anthropic | Claude 4.6 Opus (high)     |
-| `claude-4.6-sonnet-medium` | Anthropic | Claude 4.6 Sonnet (medium) |
-| `gemini-3.1-pro`           | Google    | Gemini 3.1 Pro             |
-| `grok-4-20`                | xAI       | Grok 4.20                  |
-| `kimi-k2.5`                | Moonshot  | Kimi K2.5                  |
+| Metric | Formula |
+|---|---|
+| `repair_rate` | `removed_violations / original_violations` |
+| `new_violation_rate` | `new_violations / original_violations` |
+| `connectivity_preserved` | shape-aware DFS on golden connectivity JSON (cell / block) |
 
+Detection metrics (predicted DRV regions vs golden, geometry-based, Hopcroft-Karp maximum bipartite matching per rule):
 
-See [Cursor Models and Pricing](https://cursor.com/docs/models-and-pricing) for the full list of available models. Any model supported by the Cursor Agent CLI can be passed as `model_name`. For the Codex CLI, any OpenAI model that `codex exec --model <model>` accepts (e.g. `gpt-5.4`) is valid; the reasoning effort is supplied separately via `CODEX_EFFORT` (`high` / `medium` / `low`).
+| Metric | Formula |
+|---|---|
+| `Precision` | `sum(TP) / (sum(TP) + sum(FP))` |
+| `Recall` | `sum(TP) / (sum(TP) + sum(FN))` |
+| `F1` | harmonic mean |
 
-### Intermediate Files
-
-LLM agents are instructed to place all intermediate/scratch files (test scripts, debug outputs, draft fixes) in the `temp/` directory at the project root. The `--temp_dir` flag passed to `agent_cursor.py` / `agent_claude.py` / `agent_codex.py` ensures this directory is created before the agent runs. The prompt templates embed the concrete `temp_dir` path via the `{temp_dir}` placeholder so the agent knows where to write. The `temp/` directory is automatically deleted at the end of each pipeline run.
-
-### Detection Isolation
-
-Detection agents should predict DRC violations from the layout script alone, without running a real DRC tool. To enforce this, `Dockerfile.detection`:
-
-- Ships without `klayout`, `wget`, `curl`, `pip`, `yum`, `rpm`, `gcc`, `git`, `make`, `cpio`.
-- Has `iptables` pre-installed. The entrypoint resolves known DRC-install domains (`klayout.org`, `pypi.org`, `files.pythonhosted.org`, `github.com`, `gitlab.com`, `conda.anaconda.org`, `sourceforge.net`, `dl.fedoraproject.org`, ...) to IPs and installs `OUTPUT REJECT` rules for each.
-- Leaves the rest of the internet reachable so the agent can still call the Anthropic / Cursor / OpenAI API endpoints through Docker's default NAT.
-
-Running the image requires `--cap-add=NET_ADMIN` (all three `evaluate_*.sh` scripts add this automatically for detection tasks). Repair tasks are unaffected and continue to run in `drc-benchmark-repair` with full KLayout available.
-
-### Runtime Tracking
-
-Every pipeline run appends a row to `logs/runtime.csv` with columns:
-
-```
-model, effort, task_type, design_type, case_name,
-agent_status, agent_runtime_seconds,
-input_tokens, output_tokens, cache_read_tokens, cache_write_tokens,
-timestamp
-```
-
-The score JSON embeds `runtime_seconds`, which is the **agent runtime** (subprocess wall-clock time reported by the agent wrapper).
-
-### Token Accounting
-
-Each pipeline run records four token counters captured from the CLI's JSON
-stdout:
-
-| Field | Definition |
-|-------|------------|
-| `input_tokens` | New input tokens (excluding any served from prompt cache) |
-| `cache_write_tokens` | Tokens written to the prompt cache this call |
-| `cache_read_tokens` | Tokens served from the prompt cache this call |
-| `output_tokens` | Output tokens (includes reasoning tokens; the CLI does not split them out) |
-
-CLI-level field names differ by vendor: Cursor's Agent CLI uses camelCase
-(`inputTokens`, `outputTokens`, `cacheReadTokens`, `cacheWriteTokens`); the
-Claude Code CLI uses snake_case (`input_tokens`, `output_tokens`,
-`cache_read_input_tokens`, `cache_creation_input_tokens`); the Codex CLI emits
-JSONL events whose usage fields may use snake_case (`input_tokens`,
-`output_tokens`, `cache_read_tokens`), camelCase (`inputTokens`,
-`outputTokens`), or OpenAI-style names (`prompt_tokens`, `completion_tokens`,
-`cached_tokens`). `agent_cursor.py`, `agent_claude.py`, and `agent_codex.py`
-all normalize these into the snake_case names above.
-
-On agent failure (non-zero CLI exit, unparseable JSON, missing `usage` object,
-etc.), `agent_status` is set to `"fail"` and all four token counters are
-reported as `0`; the recorded `runtime_seconds` is still the actual elapsed
-time between the agent launching and the failure.
-
-### Pipeline Logs
-
-All console output (stdout + stderr) from each pipeline run is captured to a log file at:
-
-```
-logs/<model_name>_<design_type>_<task_type>_<case_name>.log
-```
-
-The same output is still printed to the terminal in real time.
-
----
-
-## Scoring Methodology
-
-### Repair Metrics
-
-
-| Metric                   | Formula                                    | Description                                                                                                                                                                                                                                                                                                            |
-| ------------------------ | ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `repair_rate`            | `removed_violations / original_violations` | Fraction of original violations eliminated                                                                                                                                                                                                                                                                             |
-| `new_violation_rate`     | `new_violations / original_violations`     | New violations introduced relative to original count                                                                                                                                                                                                                                                                   |
-| `connectivity_preserved` | boolean                                    | Whether all original electrical connections remain (cell/block only). Uses shape-aware DFS with per-path visited vias, directional search rule, redundant via pruning, and full polygon shape identity. Golden connectivity is stored as JSON in `testcase/asap7/{cell,block}/connectivity/`. |
-
-
-### Detection Metrics (Geometry-Based)
-
-Predicted violations are matched to golden violations using **geometry-based matching**:
-
-1. Each violation's DRV region is converted to a bounding box (edge pairs use the bbox enclosing both edges).
-2. Match criteria depend on the golden bbox shape:
-  - **Polygon / non-degenerate** (`w*h > 0`): bboxes overlap AND area ratio `0.81 <= predicted_area / golden_area <= 1.21` (linear ±10% squared into area tolerance).
-  - **Edge / line** (`w*h = 0` and `w+h > 0`): both edge endpoints lie inside the predicted bbox AND the predicted bbox's longest side is at most `edge_length × 1.1`.
-  - **Dot** (`w = h = 0`): cannot match. The ingest pipeline (`process_klayout_reports.py --fix-dots`) replaces dot violations with their containing polygon's bbox so this case does not occur in practice.
-3. **Hopcroft-Karp maximum bipartite matching** is used per rule for optimal (order-independent) matching.
-4. When geometry is unavailable on either side, no TP credit is awarded (`tp=0`). Affected rules are listed in the `geometry_unavailable_rules` output field.
-5. Scoring policy: `geometry_required_edge_aware`. All TP credit requires both predicted and golden geometry.
-
-
-| Metric          | Formula                               | Description              |
-| --------------- | ------------------------------------- | ------------------------ |
-| `Precision` | `sum(TP) / (sum(TP) + sum(FP))`       | Aggregate precision      |
-| `Recall`    | `sum(TP) / (sum(TP) + sum(FN))`       | Aggregate recall         |
-| `F1`        | Harmonic mean of precision and recall | Aggregate F1             |
-
----
+Match: polygon golden bbox needs overlap and area ratio in `[0.81, 1.21]`; edge golden bbox needs both endpoints inside the predicted bbox and predicted longest side `<= edge_length * 1.1`. Score JSON schema (per-key descriptions) lives in [`evaluator/README.md`](./evaluator/README.md).
 
 ## Results
 
@@ -441,156 +249,9 @@ Predicted violations are matched to golden violations using **geometry-based mat
 
 **Notes:** Cases: B = Block, C = Cell, P = Polygon. **--**: Failed to produce a valid GDSII or preserve connectivity. Claude Code hardcodes the subagent to Claude 4.5 Haiku; in each token-count entry, the first number is the total and the number in parentheses is the Opus/Sonnet count. Cache write tokens are not available for Gemini, Grok, and GPT models (Cursor and Codex).
 
+## See also
 
----
-
-## Processed DRC Reports
-
-Golden DRC reports are pre-processed from KLayout's native `.lyrpt` XML format into structured JSON files stored at `testcase/asap7/{cell,polygon,block}/drc_report/<case_name>.drc.json`.
-
-**JSON format:**
-
-```json
-{
-  "case_name": "Cell1",
-  "design_type": "cell",
-  "total_violations": 20,
-  "total_rules_violated": 2,
-  "rules": {
-    "M1.S.4": {
-      "violation_count": 1,
-      "description": "Minimum spacing of M1 on same track is 18 nm.",
-      "violations": [
-        {
-          "type": "edge_pair",
-          "edges": [[1768, 832, 1840, 832], [1768, 944, 1840, 944]],
-          "bbox": [1768, 832, 1840, 944]
-        }
-      ]
-    }
-  }
-}
-```
-
-The pipeline uses `.drc.json` for both golden and repaired reports. After KLayout DRC runs on a repaired GDS, the `.lyrpt` results are converted to JSON for consistent comparison.
-
----
-
-## Detection Output Format
-
-The detection agent saves its predictions as a JSON array at `result/<model_name>/<design_type>/detection/<case_name>/<case_name>_detection.json`. Each top-level object represents one violated rule.
-
-All coordinates are in **dbu (database units)** -- integer coordinates from the layout script (`1 dbu = 0.00025 um`). These are the same units used by the golden `.drc.json` report.
-
-**Per-violation geometry:**
-
-- `"type": "edge_pair"` -- for spacing rules (`.S.`); contains `edge1` and `edge2`, each `[x1, y1, x2, y2]`.
-- `"type": "bbox"` -- for every other rule (width, enclosure, area, ...); contains `bbox` as `[xmin, ymin, xmax, ymax]`.
-
-**Example:**
-
-```json
-[
-  {
-    "rule_name": "M1.S.4",
-    "violation_count": 1,
-    "violations": [
-      {
-        "type": "edge_pair",
-        "edge1": [0, 200, 80, 200],
-        "edge2": [0, 312, 80, 312]
-      }
-    ]
-  },
-  {
-    "rule_name": "ACTIVE.A.1A",
-    "violation_count": 1,
-    "violations": [
-      {
-        "type": "bbox",
-        "bbox": [0, 0, 270, 270]
-      }
-    ]
-  }
-]
-```
-
-If no violations are detected, the agent writes an empty array `[]`.
-
----
-
-## Score Output
-
-Each pipeline run produces `.json` and `.csv` files at:
-
-```
-score/<run_id>/<design_type>/<task_type>/<case_name>_score.json
-score/<run_id>/<design_type>/<task_type>/<case_name>_score.csv
-```
-
-For claude and codex pipeline runs, `run_id` is `<model_name>-<effort>` (e.g. `claude-sonnet-4-6-medium`, `gpt-5.4-high`) so different effort tiers produce distinct output folders; for cursor runs, `run_id` is just `<model_name>`. `CODEX_EFFORT` is required for `run_pipeline_codex.sh`; `CLAUDE_EFFORT` is optional for `run_pipeline_claude.sh`.
-
-**Codex pipeline additional output.** Codex runs also write the raw Codex CLI JSONL (for debugging / auditing token usage) to:
-
-```
-score/<run_id>/<design_type>/<task_type>/<case_name>_agent_raw.json
-```
-
-Cursor and Claude pipeline runs do not produce this file.
-
-**Both repair and detection** include:
-
-
-| Key | Description |
-|-----|-------------|
-| `agent_status` | `"success"` or `"fail"` |
-| `runtime_seconds` | Agent wall-clock runtime |
-| `input_tokens` | New input tokens |
-| `output_tokens` | Output tokens (includes reasoning) |
-| `cache_read_tokens` | Cache read tokens |
-| `cache_write_tokens` | Cache creation tokens |
-
-
-**Repair tasks** additionally include:
-
-
-| Key | Description |
-|-----|-------------|
-| `sanity_passed` | Overall result of structural sanity checks (`true` / `false`) |
-| `sanity_details` | Human-readable summary of any failed sanity checks |
-| `top_cell_exists` | Modified GDS has a top cell matching the original |
-| `gds_not_empty` | Modified GDS contains at least one shape |
-| `critical_layers_preserved` | All ASAP7 critical layers (nwell / fin / gate / active / v0 / m1) present |
-| `cell_structure_intact` | No original cell definitions were deleted |
-| `outline_boundary_respected` | (cell/block) All shapes within the original outline region |
-| `protruding_layers` | (cell/block, only on failure) List of layers with shapes outside the original outline, including layer/datatype and the enclosing bbox |
-| `instance_placements_unchanged` | (cell/block) Subcell instance placements match the original |
-| `missing_instances` | (cell/block, only on failure) Subcell instances from the original that are missing or moved in the modified layout |
-| `extra_instances` | (cell/block, only on failure) Subcell instances present in the modified layout but not in the original |
-| `polygon_shape_counts_ok` | (polygon) Per-layer shape counts unchanged vs. original |
-| `shape_count_mismatches` | (polygon, only on failure) Per-layer delta between original and modified shape counts |
-| `connectivity_preserved` | (cell/block) All original electrical connections remain |
-
-
-**Detection tasks** additionally include:
-
-
-| Key                          | Description                                                        |
-| ---------------------------- | ------------------------------------------------------------------ |
-| `matching_algorithm`         | `"hopcroft_karp"` -- algorithm used for violation matching         |
-| `scoring_policy`             | `"geometry_required_edge_aware"` -- TP credit requires geometry on both sides; uses edge-encompass matching for line-shaped golden bboxes |
-| `mercy_low` / `mercy_high`   | `0.81` / `1.21` -- area ratio bounds for polygon matches |
-| `edge_side_tolerance`        | `1.1` -- multiplier on `edge_length` that caps the predicted bbox's longest side for edge matches |
-| `geometry_unavailable_rules` | List of rule names where geometry was missing (tp forced to 0)     |
-
-
----
-
-## Design Types
-
-
-| Type      | Count | DRC Rule File      | Description                                                                                                                                                                 |
-| --------- | ----- | ------------------ | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `cell`    | 255   | `asap7_cell.lydrc` | Standard-cell layouts (10-50 polygons, 5-15 violations)                                                                                                                     |
-| `polygon` | 332   | `asap7.lydrc`      | Isolated polygon constructs testing specific DRC rules. Repair is restricted to resizing (width/length) or moving polygons; deletion and adding new polygons are forbidden. |
-| `block`   | 7     | `asap7.lydrc`      | Larger block-level layouts with routing and vias (100+ polygons)                                                                                                            |
+- [`src/README.md`](./src/README.md) — pipeline orchestration scripts.
+- [`agent/README.md`](./agent/README.md) — agent dispatcher, prompts, trust-boundary contract.
+- [`evaluator/README.md`](./evaluator/README.md) — trusted score-phase bundle, manifest, score JSON schema, full hardening invariants.
+- [`testcase/README.md`](./testcase/README.md) — ASAP7 PDK and benchmark cases.

@@ -1,0 +1,24 @@
+{
+  "_comment": "Extra seccomp rules merged on top of docker/seccomp-default.json (moby v24.0.7) by scripts/build_seccomp_profile.sh. defaultAction stays SCMP_ACT_ERRNO (matches docker default); these extras only ADD new SCMP_ACT_ERRNO matches that are NOT covered by the default profile (NETLINK_NETFILTER netlink socket — used by nft / netfilter shaping that could otherwise reach /proc/net/* control planes outside iptables-legacy).",
+  "extra": [
+    {
+      "names": ["socket"],
+      "action": "SCMP_ACT_ERRNO",
+      "errnoRet": 1,
+      "args": [
+        {
+          "index": 0,
+          "value": 16,
+          "op": "SCMP_CMP_EQ",
+          "comment": "AF_NETLINK"
+        },
+        {
+          "index": 2,
+          "value": 12,
+          "op": "SCMP_CMP_EQ",
+          "comment": "NETLINK_NETFILTER"
+        }
+      ]
+    }
+  ]
+}
