@@ -30,7 +30,7 @@ Two tasks are evaluated:
 - [`src/`](./src) — pipeline orchestration scripts (`run_pipeline_*.sh`, `evaluate_*.sh`, `lib_helpers.sh`, `build_case_info.py`). See [`src/README.md`](./src/README.md).
 - [`agent/`](./agent) — unified LLM agent layer (`agent.py` dispatcher, prompt JSON templates, `skill.md`, backends). See [`agent/README.md`](./agent/README.md).
 - [`CUSTOM_AGENT.md`](./CUSTOM_AGENT.md) — contract guide for building a custom agentic flow (required filenames, CLI signature, stderr markers, info.json placeholders, minimum-viable skeleton).
-- [`evaluator/`](./evaluator) — trusted score-phase bundle (DRC runner, scorers, sanity / connectivity, manifest, `trusted_bin/`). See [`evaluator/README.md`](./evaluator/README.md).
+- [`evaluator/`](./evaluator) — trusted score-phase bundle (DRC runner, scorers, sanity / connectivity, `compute_evaluator_hash.py`, `trusted_bin/`). See [`evaluator/README.md`](./evaluator/README.md). Token-recording backends live in `src/agent_backend/` (frozen, image-baked).
 - [`testcase/`](./testcase) — ASAP7 PDK + 594 cases (`cell` 255 / `polygon` 332 / `block` 7). See [`testcase/README.md`](./testcase/README.md).
 - [`CASE_STAT.md`](./CASE_STAT.md) — per-design-type and per-case statistics (violation counts, rule frequencies, die / core area).
 - [`scripts/`](./scripts) — one-time setup (`build_trusted_bin.sh`, `build_seccomp_profile.sh`).
@@ -42,7 +42,7 @@ Two tasks are evaluated:
 ### Prerequisites
 
 - **Docker** — for building and running the benchmark container.
-- **Cursor CLI on the host** (for Cursor pipeline) — install and log in:
+- **Cursor CLI on the host** (for Cursor pipeline) — install and log in. The Cursor installer puts the binary on PATH as `agent` (not `cursor`):
   ```bash
   curl https://cursor.com/install -fsS | bash
   agent login
@@ -87,7 +87,7 @@ Run from `DAC26_DRC_Benchmark/`. Each case feeds one `info.json` (use one from [
 | Flag | Runs | When to use |
 |---|---|---|
 | `--agent-only` | Prompt format → agent call → persist `.agent_meta.json` | **Phase 1** of every paper run. |
-| `--score-only` | Manifest verify (fail-closed if `HARDENED_EVALUATION=1`) → render / DRC / sanity / connectivity (repair) or detection scorer → CSV + runtime log | **Phase 2** of every paper run, after the host disconnect / kill / manifest-inject handoff. |
+| `--score-only` | Render / DRC / sanity / connectivity (repair) or detection scorer → CSV + runtime log; score JSON embeds `evaluator_hash` | **Phase 2** of every paper run, after the host disconnect / kill / evaluator-inject handoff. |
 | *(none)* | Both phases back-to-back inside one container invocation | Smoke testing only — bypasses the host-side trust-boundary handoff, so scores are **not** paper-comparable. |
 
 Both repair and detection use the same `--agent-only` → handoff → `--score-only` split. The only difference: repair `docker cp`s the golden DRC report **before** the agent (legitimate input); detection does it **after** the kill / disconnect step (and `postprocess_info_json.py` rewrites `path_to_drc_report` to `""` for the agent).
@@ -98,10 +98,10 @@ Both repair and detection use the same `--agent-only` → handoff → `--score-o
 |---|---|---|---|
 | `PIPELINE` | `run_pipeline_cursor.sh` | `run_pipeline_claude.sh` | `run_pipeline_codex.sh` |
 | Host → container auth | `~/.config/cursor/auth.json` → `/root/.config/cursor/auth.json` | `~/.claude/.credentials.json` → `/root/.claude/.credentials.json` | `~/.codex/auth.json` → `/root/.codex/auth.json` |
-| `EFFORT_ENV` (both phases) | `()` | `(-e CLAUDE_EFFORT=high)` | `(-e CODEX_EFFORT=high)` |
+| `EFFORT_ENV` (both phases) | `()` | `(-e CLAUDE_EFFORT=medium)` | `(-e CODEX_EFFORT=high)` |
 | `AGENT_EXTRA_ENV` (agent only) | `()` | `(-e CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000)` | `()` |
 
-`TASK=detection` additionally needs `--cap-add=NET_ADMIN` on `docker create` (the script below sets `NET_FLAG` from `$TASK` automatically). Run `scripts/build_seccomp_profile.sh` once on the host first to produce `docker/seccomp-default.json` — without it, the `HARDEN_FLAGS` block below errors out.
+`TASK=detection` additionally needs `--cap-add=NET_ADMIN` on `docker create` (the script below sets `NET_FLAG` from `$TASK` automatically). Run `scripts/build_seccomp_profile.sh` once on the host first to produce `docker/seccomp-no-iptables.json` — without it, the `HARDEN_FLAGS` block below errors out.
 
 ```bash
 # === knobs ===
@@ -117,11 +117,11 @@ AGENT_EXTRA_ENV=(-e CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000)  # agent phase ONLY (Cl
 IMAGE="drc-benchmark-${TASK}"           # repair -> -repair, detection -> -detection
 NET_FLAG=(); [[ "$TASK" == "detection" ]] && NET_FLAG=(--cap-add=NET_ADMIN)
 
-# Paper-grade hardening flags (mirror evaluate_claude.sh:296-310).
+# Paper-grade hardening flags (mirror the `harden_flags` block in src/evaluate_claude.sh).
 # Run scripts/build_seccomp_profile.sh once on the host first; produces
-# docker/seccomp-default.json. Skip these three lines for a quick smoke
+# docker/seccomp-no-iptables.json. Skip these three lines for a quick smoke
 # test; the scores will then NOT be paper-comparable.
-SECCOMP="$(pwd)/docker/seccomp-default.json"
+SECCOMP="$(pwd)/docker/seccomp-no-iptables.json"
 HARDEN_FLAGS=(--cap-drop=LINUX_IMMUTABLE
               --security-opt "seccomp=${SECCOMP}"
               --security-opt no-new-privileges)
@@ -134,7 +134,7 @@ mkdir -p "$SEALED_DIR"
 
 # Trust-boundary helpers (disconnect_container_network, kill_leftover_processes,
 # reinject_critical_binaries, parse_agent_stderr, write_trusted_agent_meta,
-# generate_evaluator_manifest). Source from src/ — agent/ does not see this.
+# Source from src/ — agent/ does not see this.
 source src/lib_helpers.sh
 
 # ----- Stage container (agent/ read-only; evaluator/ NOT mounted) -----
@@ -196,11 +196,8 @@ eval "$(parse_agent_stderr "$AGENT_STDERR")"
 write_trusted_agent_meta "$SEALED_DIR/${CASE}_agent_meta.json" \
     "$agent_status" "$agent_runtime_seconds" "$tokens_json"
 
-generate_evaluator_manifest "$HOST_DIR" "$SEALED_DIR/evaluator.sha256"
 docker exec "$CONTAINER" mkdir -p /workspace/evaluator /workspace/temp/sealed
 docker cp evaluator/. "$CONTAINER:/workspace/evaluator/"
-docker cp "$SEALED_DIR/evaluator.sha256" \
-    "$CONTAINER:/workspace/evaluator/evaluator.sha256"
 docker cp "$SEALED_DIR/${CASE}_agent_meta.json" \
     "$CONTAINER:/workspace/temp/sealed/${CASE}_agent_meta.json"
 
@@ -211,9 +208,8 @@ if [[ "$TASK" == "detection" ]]; then
         "$CONTAINER:/workspace/testcase/asap7/$DESIGN/drc_report/"
 fi
 
-# ============= Phase 2: --score-only (HARDENED_EVALUATION=1 fail-closes the
-# manifest verify; EVALUATOR_DIR + TRUSTED_PYTHON satisfy the score-phase
-# invariants in run_pipeline_*.sh). =============
+# ============= Phase 2: --score-only (HARDENED_EVALUATION=1 + EVALUATOR_DIR
+# + TRUSTED_PYTHON satisfy the score-phase invariants in run_pipeline_*.sh). =============
 docker exec "${EFFORT_ENV[@]}" \
     -e HARDENED_EVALUATION=1 \
     -e EVALUATOR_DIR=/workspace/evaluator \
@@ -260,7 +256,7 @@ IMAGE="drc-benchmark-${TASK}"           # resolves to drc-benchmark-detection
 NET_FLAG=(); [[ "$TASK" == "detection" ]] && NET_FLAG=(--cap-add=NET_ADMIN)
 ```
 
-**Output locations:** `score/<run_id>/<design>/<task>/<case>_score.json`, trusted `.sealed_audit/<case>/{agent_meta.json,evaluator.sha256}`, and a per-run row appended to `logs/runtime.csv`. For prompt iteration where paper-comparable scores don't matter, pre-inject the full `evaluator/` bundle and run `bash src/${PIPELINE} /workspace/task/info.json` (no flag) — Full mode bypasses the trust-boundary handoff.
+**Output locations:** `score/<run_id>/<design>/<task>/<case>_score.json` (each carries an `evaluator_hash` field), trusted `.sealed_audit/<case>/agent_meta.json`, and a per-run row appended to `logs/runtime.csv`. For prompt iteration where paper-comparable scores don't matter, pre-inject the full `evaluator/` bundle and run `bash src/${PIPELINE} /workspace/task/info.json` (no flag) — Full mode bypasses the trust-boundary handoff.
 
 ### 3. Reproduce paper experiments
 
@@ -280,10 +276,12 @@ host (evaluate_*.sh)
   -> agent phase   : run_pipeline_*.sh -> agent/agent.py --backend <b>
                      (evaluator/ NOT mounted; iptables blocklist active for detection)
   -> kill leftover, network disconnect, docker cp evaluator/. + trusted_bin
-  -> score phase   : verify_evaluator_bundle (sha256 manifest)
+  -> score phase   : embed evaluator_hash into score JSON
                      -> render (repair) -> KLayout DRC -> sanity / connectivity
                      -> score_repair.py | score_detection.py -> CSV + runtime.csv
 ```
+
+**Per-call token recording (mandatory):** every agent backend writes one `${AGENT_CALLS_DIR}/<ID>.json` per LLM call, where `<ID>=${case_name}_${call_seq:04d}_<sha8>` (flat directory shared across cases). Each per-call JSON carries the four-key totals plus a `by_model` breakdown — Claude Code's haiku subagent tokens are recorded under their own model key. After the agent is killed, `evaluator/aggregate_call_tokens.py` (called by the host via `aggregate_call_tokens_for_case` in `src/lib_helpers.sh`) sums totals and forwards `n_call_ids_valid` to the `num_calls` column of `logs/runtime.csv`. Fail-closed: if `STATUS=success` but zero per-call files exist for the case, `write_invalid_score.py` emits a null score with `invalid_reason=mandatory_calls_recording_missing`. Central writer: `src/agent_backend/per_call_writer_helpers.py`. Full contract: [`CUSTOM_AGENT.md`](./CUSTOM_AGENT.md) §"Per-call token recording".
 
 Step-level details live in [`src/README.md`](./src/README.md); trusted-bundle internals in [`evaluator/README.md`](./evaluator/README.md).
 
@@ -293,8 +291,8 @@ Step-level details live in [`src/README.md`](./src/README.md); trusted-bundle in
 - For detection cases, `evaluator/postprocess_info_json.py` rewrites `path_to_drc_report` to the empty string in the agent-visible info.json — the gate that keeps the detection agent from reading the golden DRC report.
 - `Dockerfile.detection` ships without KLayout / wget / curl / pip / yum / git; entrypoint installs an iptables OUTPUT REJECT list on klayout.org / pypi.org / github.com / etc., then drops `NET_ADMIN` from the bounding set.
 - All score-phase `docker exec` calls go through `secured-exec.sh` with `HARDENED_EVALUATION=1` and `EVALUATOR_DIR=/workspace/evaluator`.
-- `evaluator.sha256` manifest is verified by `verify_evaluator_bundle` as the first step of the score phase (fail-closed).
-- `evaluator/trusted_bin/{bash,python3,sha256sum}` are re-injected over `*-trusted` paths after agent kill, so a tampered `/bin/bash` cannot subvert manifest verification.
+- Each per-case score JSON carries an additive `evaluator_hash` field (multi-line sha256sum-style) recording which evaluator bundle produced that score. Pipeline does not verify at runtime; cross-host reproducibility check is reader-side.
+- `evaluator/trusted_bin/{bash,python3,sha256sum}` are re-injected over `*-trusted` paths after agent kill, so a tampered `/bin/bash` cannot subvert score-phase execution.
 
 Full definitions and injection sequence: [`evaluator/README.md`](./evaluator/README.md). Agent-side contract: [`agent/README.md`](./agent/README.md).
 
@@ -345,5 +343,5 @@ Match: polygon golden bbox needs overlap and area ratio in `[0.81, 1.21]`; edge 
 
 - [`src/README.md`](./src/README.md) — pipeline orchestration scripts.
 - [`agent/README.md`](./agent/README.md) — agent dispatcher, prompts, trust-boundary contract.
-- [`evaluator/README.md`](./evaluator/README.md) — trusted score-phase bundle, manifest, score JSON schema, full hardening invariants.
+- [`evaluator/README.md`](./evaluator/README.md) — trusted score-phase bundle, score JSON schema with `evaluator_hash`, full hardening invariants.
 - [`testcase/README.md`](./testcase/README.md) — ASAP7 PDK and benchmark cases.

@@ -65,7 +65,7 @@ while [[ "${1:-}" == --* ]]; do
 done
 
 # In --score-only mode, read helper scripts (parse_info_json,
-# postprocess_info_json, check_connectivity) from the manifest-verified
+# postprocess_info_json, check_connectivity) from the trusted
 # /workspace/evaluator/ bundle that the host injected after agent kill, not
 # from /workspace/evaluator_helpers/ which the agent may have tampered.
 if [[ "${phase}" == "score" && -d "${evaluator_dir}" ]]; then
@@ -222,6 +222,18 @@ score_dir="${workspace}/score/${run_id}/${design_type}/${task_type}"
 temp_dir="${workspace}/temp/${run_id}_${design_type}_${task_type}_${case_name}_$$"
 mkdir -p "${result_dir}" "${score_dir}" "${temp_dir}"
 
+# Per-case AGENT_CALLS_DIR; gated on phase != score.
+# Shared flat dir across cases; scope-clean stale files for THIS
+# case only (do not rm -rf the shared calls/ tree). Parallel same-case
+# runs (same run_id/model_name/design_type/task_type/case_name tuple) on
+# the same host are caller responsibility; bump --run_id to isolate.
+if [[ "${phase}" != "score" ]]; then
+    export AGENT_CALLS_DIR="${score_dir}/calls"
+    export AGENT_CASE_NAME="${case_name}"
+    mkdir -p "${AGENT_CALLS_DIR}"
+    rm -f "${AGENT_CALLS_DIR}/${case_name}_"*.json 2>/dev/null || true
+fi
+
 if [[ "${task_type}" == "repair" ]]; then
     agent_output="${result_dir}/${case_name}_repaired.py"
 else
@@ -336,17 +348,6 @@ if [[ "${task_type}" == "repair" ]]; then
     # Score phase entry: switch to TRUSTED_PYTHON if injected.
     PY="${TRUSTED_PYTHON:-python3}"
     agent_meta_path="/workspace/temp/sealed/${case_name}_agent_meta.json"
-
-    # At score-phase entry, verify the evaluator
-    # manifest first. Invariant: when HARDENED_EVALUATION=1, missing
-    # manifest / hash mismatch / file-set mismatch all fail-closed exit 1. In
-    # legacy mode, missing manifest is only a WARN.
-    if [[ "${HARDENED_EVALUATION:-0}" == "1" ]]; then
-        bash "${evaluator_dir}/verify_evaluator_bundle.sh" || {
-            echo "ERROR: evaluator manifest verify failed" >&2
-            exit 1
-        }
-    fi
 
     # Recover meta for score-only mode
     if [[ -f "${meta_file}" ]]; then
@@ -543,17 +544,6 @@ else
     # Score phase entry: switch to TRUSTED_PYTHON if injected.
     PY="${TRUSTED_PYTHON:-python3}"
 
-    # At score-phase entry, verify the evaluator
-    # manifest first. Invariant: when HARDENED_EVALUATION=1, missing
-    # manifest / hash mismatch / file-set mismatch all fail-closed exit 1. In
-    # legacy mode, missing manifest is only a WARN.
-    if [[ "${HARDENED_EVALUATION:-0}" == "1" ]]; then
-        bash "${evaluator_dir}/verify_evaluator_bundle.sh" || {
-            echo "ERROR: evaluator manifest verify failed" >&2
-            exit 1
-        }
-    fi
-
     # When agent fails, fail-closed by writing null
     # metrics + null tokens score JSON / CSV, to prevent downstream
     # score_detection.py from trying to parse an empty file. trusted meta is
@@ -624,13 +614,15 @@ mkdir -p "${log_dir}"
 runtime_csv="${log_dir}/runtime.csv"
 timestamp_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 
+# NUM_CALLS: optional; defaults to 0 for legacy single-call agents.
 "${PY:-python3}" "${evaluator_dir}/log_runtime.py" \
     "${runtime_csv}" \
     "${model_name}" "${codex_effort}" "${task_type}" "${design_type}" "${case_name}" \
     "${agent_status}" \
     "${agent_runtime_seconds}" \
     "${tokens_json}" \
-    "${timestamp_now}"
+    "${timestamp_now}" \
+    --num-calls "${NUM_CALLS:-0}"
 
 echo "  Score: ${score_json}"
 echo ""

@@ -49,6 +49,7 @@
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -268,6 +269,21 @@ def main() -> int:
         null_tokens=args.null_tokens,
         agent_meta=agent_meta,
     )
+
+    # ----- Embed evaluator_hash (sha256sum-style over evaluator/*.py + *.sh).
+    # Sibling import works because the pipeline invokes us positionally
+    # (python3 ${evaluator_dir}/write_invalid_score.py ...), placing the
+    # evaluator directory at sys.path[0]. Try/except so an import bug
+    # never kills the fail-closed handler — semantic-empty hash makes
+    # the failure visible without losing the rest of the record.
+    try:
+        from compute_evaluator_hash import compute_evaluator_hash
+        record["evaluator_hash"] = compute_evaluator_hash(
+            os.path.dirname(os.path.abspath(__file__)))
+    except Exception as _exc:
+        sys.stderr.write(
+            "WARN: evaluator_hash compute failed: {!r}\n".format(_exc))
+        record["evaluator_hash"] = ""
 
     out_path = Path(args.output)
     try:

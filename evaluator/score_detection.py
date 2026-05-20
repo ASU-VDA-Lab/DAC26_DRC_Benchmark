@@ -56,6 +56,7 @@
 
 import argparse
 import json
+import os
 import re
 import sys
 import xml.etree.ElementTree as et
@@ -570,6 +571,21 @@ def main():
     result["output_tokens"]         = int(tokens.get("output_tokens", 0))
     result["cache_read_tokens"]     = int(tokens.get("cache_read_tokens", 0))
     result["cache_write_tokens"]    = int(tokens.get("cache_write_tokens", 0))
+
+    # ----- Embed evaluator_hash (sha256sum-style over evaluator/*.py + *.sh).
+    # Pipeline invokes us as `python3 ${evaluator_dir}/score_detection.py ...`
+    # so sys.path[0] is the evaluator directory and the sibling import
+    # resolves. Wrap in try/except so a future import bug does not kill
+    # the whole score; an empty string makes the failure visible to
+    # readers without losing the rest of the record.
+    try:
+        from compute_evaluator_hash import compute_evaluator_hash
+        result["evaluator_hash"] = compute_evaluator_hash(
+            os.path.dirname(os.path.abspath(__file__)))
+    except Exception as _exc:
+        sys.stderr.write(
+            "WARN: evaluator_hash compute failed: {!r}\n".format(_exc))
+        result["evaluator_hash"] = ""
 
     # ----- write output file (no longer prints to stdout) -----
     with open(args.output, "w") as f:

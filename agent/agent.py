@@ -55,15 +55,21 @@ import os
 import shutil
 import sys
 
-# bootstrap sys.path so ``agent.backends.*`` resolves
+# bootstrap sys.path so ``agent.*`` and ``agent_backend.*`` resolve
 # whether the dispatcher is launched from /workspace, /workspace/agent, or
-# elsewhere. We insert the parent directory of this file (typically
-# ``/workspace``) at index 0 so the explicit ``agent/__init__.py`` package
-# wins over any shadow ``agent`` packages on PYTHONPATH.
+# elsewhere. We insert the parent directory of this file (``/workspace``)
+# and /workspace/src at index 0 so the explicit ``agent/__init__.py`` and
+# ``src/agent_backend/__init__.py`` packages win over any shadow packages
+# on PYTHONPATH. Stdlib-shadow hazard: do NOT add modules with
+# stdlib-shadowing names (json.py, os.py, etc.) directly at the
+# ``src/`` top level — they would be picked up by the prepend (see
+# ``src/README.md``).
 _HERE = os.path.dirname(os.path.abspath(__file__))
 _PARENT = os.path.dirname(_HERE)
-if _PARENT not in sys.path:
-    sys.path.insert(0, _PARENT)
+_SRC = os.path.join(_PARENT, "src")
+for _p in (_PARENT, _SRC):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
 
 
 _VALID_BACKENDS = ("claude", "codex", "cursor")
@@ -207,7 +213,7 @@ def main():
 
     # -- Lazy import the backend module ---------------------------------------
     try:
-        backend = importlib.import_module("agent.backends." + backend_name)
+        backend = importlib.import_module("agent_backend." + backend_name)
     except Exception as exc:
         sys.stderr.write("ERROR: failed to import backend '{}': {}\n".format(
             backend_name, exc))

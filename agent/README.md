@@ -11,9 +11,10 @@ Agent dispatcher, prompt JSON templates, and `skill.md` — the agent-side of th
 - `agent.py` — unified dispatcher. Single entry point for `run_pipeline_*.sh`; selects backend via `--backend {claude,codex,cursor}`.
 - `prompt_format.py` — JSON-template -> plain-text prompt renderer (uses `string.Template` + `_SafeDict`).
 - `skill.md` — ASAP7 DRC knowledge handed to the agent via `path_to_skill` (kept as Markdown, not JSON).
-- `backends/{claude,codex,cursor}.py` — per-CLI `call_agent(prompt_text, output_path, model, workspace=None, effort=None) -> dict{status, runtime_seconds, tokens, raw_data, error}`.
+- Backend modules live in `src/agent_backend/` (frozen, image-baked). See `CUSTOM_AGENT.md` "Backend CLI invariants (frozen)".
 - `prompts/{detection,repair_cell,repair_block,repair_polygon}.json` — prompt templates (one per task).
-- `__init__.py` and `backends/__init__.py` are explicit empty package markers; do not switch to PEP 420 namespace packages — name collisions break the dispatcher.
+- `__init__.py` is an explicit empty package marker; do not switch to PEP 420 namespace packages — name collisions break the dispatcher.
+- `AGENT_CALLS_DIR` (env var, exported by `run_pipeline_*.sh` during the agent phase, set to `${score_dir}/calls/`) — flat directory where each backend writes one per-call JSON named `${case_name}_${call_seq:04d}_<sha8>.json`. The host's post-kill aggregator (`evaluator/aggregate_call_tokens.py`) sums the four-key token totals and the `by_model` breakdown, and records `num_calls` in `runtime.csv`. Per-case score JSON carries an `evaluator_hash` field. Full contract: [`../CUSTOM_AGENT.md`](../CUSTOM_AGENT.md) §"Per-call token recording".
 
 ## Trust boundary
 
@@ -25,5 +26,5 @@ Agent dispatcher, prompt JSON templates, and `skill.md` — the agent-side of th
 ## See also
 
 - [`../CUSTOM_AGENT.md`](../CUSTOM_AGENT.md) — how to build a custom agent that satisfies the frozen pipeline's contracts (CLI args, stderr markers, output schema, info.json placeholders, sample skeleton).
-- [`../evaluator/README.md`](../evaluator/README.md) — score-phase bundle, `HARDENED_EVALUATION` / `secured-exec.sh` / manifest contract.
+- [`../evaluator/README.md`](../evaluator/README.md) — score-phase bundle, `HARDENED_EVALUATION` / `secured-exec.sh` / `evaluator_hash` contract.
 - [`../src/README.md`](../src/README.md) — pipeline scripts that drive `agent.py`.
