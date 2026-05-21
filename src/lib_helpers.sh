@@ -176,6 +176,17 @@ parse_agent_stderr() {
     raw_status="$(grep -oP 'STATUS=\K[A-Za-z_]+' "${stderr_log}" 2>/dev/null | tail -1)"
     case "${raw_status}" in
         success|fail) agent_status="${raw_status}" ;;
+        "")
+            # Distinguish "no marker at all" (host stderr log lost / truncated)
+            # from "explicit STATUS=fail". Caller should fall back to per-call
+            # file evidence; emit a forensic WARN so the regression is visible.
+            agent_status="fail"
+            if [[ -s "${stderr_log}" ]]; then
+                echo "WARN: parse_agent_stderr: STATUS= marker absent in ${stderr_log} (size=$(wc -c <"${stderr_log}") bytes). Possible marker-loss event; caller should rely on per-call file fallback." >&2
+            else
+                echo "WARN: parse_agent_stderr: stderr_log empty (${stderr_log})." >&2
+            fi
+            ;;
         *)            agent_status="fail" ;;
     esac
 

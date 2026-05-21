@@ -374,6 +374,37 @@ for model_name in "${MODEL_NAMES[@]}"; do
                     if [[ "${_agg_source}" == "per_call_files" ]]; then
                         tokens_json="${_agg_tokens}"
                         num_calls="${_agg_num}"
+                        # Per-call file is written only on agent-success branch
+                        # in agent_backend/*.py (O_CREAT|O_EXCL). Its presence
+                        # is independent proof the agent CLI completed. If the
+                        # text-marker scrape said fail (e.g., host stderr log
+                        # truncated by a concurrent docker-daemon race), promote
+                        # status to success and rescue runtime from per-call.
+                        if [[ "${agent_status:-fail}" != "success" ]]; then
+                            echo "WARN: agent_status='${agent_status:-fail}' from stderr markers but per-call file present (n=${num_calls}); promoting to success." >&2
+                            agent_status="success"
+                            _pcf="$(find "${calls_dir_on_host}" -maxdepth 1 -type f -name "${case_name}_*.json" 2>/dev/null | sort | head -1)"
+                            if [[ -n "${_pcf}" ]]; then
+                                _rt="$(python3 -c '
+import json, sys
+from datetime import datetime
+try:
+    d = json.load(open(sys.argv[1]))
+    s = d.get("started_at"); f = d.get("finished_at")
+    if s and f:
+        ts = datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+        tf = datetime.strptime(f, "%Y-%m-%dT%H:%M:%SZ")
+        print((tf - ts).total_seconds())
+    else:
+        print(0)
+except Exception:
+    print(0)
+' "${_pcf}" 2>/dev/null || echo 0)"
+                                if [[ "${_rt}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ "${_rt}" != "0" ]]; then
+                                    agent_runtime_seconds="${_rt}"
+                                fi
+                            fi
+                        fi
                     elif [[ "${_agg_source}" == "mandatory_calls_recording_missing" ]]; then
                         agent_status="fail"
                         num_calls=0
@@ -479,6 +510,37 @@ for model_name in "${MODEL_NAMES[@]}"; do
                     if [[ "${_agg_source}" == "per_call_files" ]]; then
                         tokens_json="${_agg_tokens}"
                         num_calls="${_agg_num}"
+                        # Per-call file is written only on agent-success branch
+                        # in agent_backend/*.py (O_CREAT|O_EXCL). Its presence
+                        # is independent proof the agent CLI completed. If the
+                        # text-marker scrape said fail (e.g., host stderr log
+                        # truncated by a concurrent docker-daemon race), promote
+                        # status to success and rescue runtime from per-call.
+                        if [[ "${agent_status:-fail}" != "success" ]]; then
+                            echo "WARN: agent_status='${agent_status:-fail}' from stderr markers but per-call file present (n=${num_calls}); promoting to success." >&2
+                            agent_status="success"
+                            _pcf="$(find "${calls_dir_on_host}" -maxdepth 1 -type f -name "${case_name}_*.json" 2>/dev/null | sort | head -1)"
+                            if [[ -n "${_pcf}" ]]; then
+                                _rt="$(python3 -c '
+import json, sys
+from datetime import datetime
+try:
+    d = json.load(open(sys.argv[1]))
+    s = d.get("started_at"); f = d.get("finished_at")
+    if s and f:
+        ts = datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+        tf = datetime.strptime(f, "%Y-%m-%dT%H:%M:%SZ")
+        print((tf - ts).total_seconds())
+    else:
+        print(0)
+except Exception:
+    print(0)
+' "${_pcf}" 2>/dev/null || echo 0)"
+                                if [[ "${_rt}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ "${_rt}" != "0" ]]; then
+                                    agent_runtime_seconds="${_rt}"
+                                fi
+                            fi
+                        fi
                     elif [[ "${_agg_source}" == "mandatory_calls_recording_missing" ]]; then
                         agent_status="fail"
                         num_calls=0

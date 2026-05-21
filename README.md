@@ -116,6 +116,7 @@ EFFORT_ENV=(-e CLAUDE_EFFORT=medium)              # used by BOTH agent and score
 AGENT_EXTRA_ENV=(-e CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000)  # agent phase ONLY (Claude-specific)
 IMAGE="drc-benchmark-${TASK}"           # repair -> -repair, detection -> -detection
 NET_FLAG=(); [[ "$TASK" == "detection" ]] && NET_FLAG=(--cap-add=NET_ADMIN)
+RUN_ID="claude-sonnet-4-6-medium"       # claude / codex: ${model_name}-${effort}; cursor: ${model_name}
 
 # Paper-grade hardening flags (mirror the `harden_flags` block in src/evaluate_claude.sh).
 # Run scripts/build_seccomp_profile.sh once on the host first; produces
@@ -193,6 +194,26 @@ kill_leftover_processes     "$CONTAINER"
 reinject_critical_binaries  "$CONTAINER" "$HOST_DIR" post-kill
 
 eval "$(parse_agent_stderr "$AGENT_STDERR")"
+
+# Aggregate per-call token JSONs (each backend writes one to ${score_dir}/calls/<ID>.json
+# during agent phase). Mandatory: if STATUS=success but no per-call file is found,
+# scoring fails-closed with invalid_reason=mandatory_calls_recording_missing.
+CALLS_DIR="$HOST_DIR/score/$RUN_ID/$DESIGN/$TASK/calls"
+REQ=""; [[ "$agent_status" == "success" ]] && REQ="--require-files"
+_agg=$(aggregate_call_tokens_for_case "$CALLS_DIR" "$CASE" \
+    "$SEALED_DIR/${CASE}_tokens_combined.json" "$tokens_json" \
+    "$SEALED_DIR/${CASE}_aggregate.log" "$REQ")
+_src=$(printf '%s' "$_agg" | awk -F'|' '{print $3}')
+if [[ "$_src" == "per_call_files" ]]; then
+    tokens_json=$(printf '%s' "$_agg" | awk -F'|' '{print $1}')
+    num_calls=$(printf '%s' "$_agg" | awk -F'|' '{print $2}')
+elif [[ "$_src" == "mandatory_calls_recording_missing" ]]; then
+    agent_status="fail"
+    num_calls=0
+else
+    num_calls=0
+fi
+
 write_trusted_agent_meta "$SEALED_DIR/${CASE}_agent_meta.json" \
     "$agent_status" "$agent_runtime_seconds" "$tokens_json"
 
@@ -209,11 +230,13 @@ if [[ "$TASK" == "detection" ]]; then
 fi
 
 # ============= Phase 2: --score-only (HARDENED_EVALUATION=1 + EVALUATOR_DIR
-# + TRUSTED_PYTHON satisfy the score-phase invariants in run_pipeline_*.sh). =============
+# + TRUSTED_PYTHON satisfy the score-phase invariants in run_pipeline_*.sh;
+# NUM_CALLS is forwarded into the runtime.csv num_calls column). =============
 docker exec "${EFFORT_ENV[@]}" \
     -e HARDENED_EVALUATION=1 \
     -e EVALUATOR_DIR=/workspace/evaluator \
     -e TRUSTED_PYTHON=/usr/local/bin/python3-trusted \
+    -e "NUM_CALLS=${num_calls:-0}" \
     "$CONTAINER" \
     bash "src/${PIPELINE}" --score-only /workspace/task/info.json
 
@@ -237,6 +260,7 @@ EFFORT_ENV=()                            # Cursor CLI has no --effort
 AGENT_EXTRA_ENV=()                       # no Cursor-specific agent extras
 IMAGE="drc-benchmark-${TASK}"           # resolves to drc-benchmark-repair
 NET_FLAG=(); [[ "$TASK" == "detection" ]] && NET_FLAG=(--cap-add=NET_ADMIN)
+RUN_ID="gpt-5.4-high"                    # cursor: run_id == model_name verbatim
 ```
 
 **Codex + detection** (uses [`example/cell1_detection_codex.json`](./example/cell1_detection_codex.json)):
@@ -254,6 +278,7 @@ EFFORT_ENV=(-e CODEX_EFFORT=high)        # used by BOTH agent and score phases
 AGENT_EXTRA_ENV=()                       # no Codex-specific agent extras
 IMAGE="drc-benchmark-${TASK}"           # resolves to drc-benchmark-detection
 NET_FLAG=(); [[ "$TASK" == "detection" ]] && NET_FLAG=(--cap-add=NET_ADMIN)
+RUN_ID="gpt-5.4-high"                    # codex: ${model_name}-${codex_effort}
 ```
 
 **Output locations:** `score/<run_id>/<design>/<task>/<case>_score.json` (each carries an `evaluator_hash` field), trusted `.sealed_audit/<case>/agent_meta.json`, and a per-run row appended to `logs/runtime.csv`. For prompt iteration where paper-comparable scores don't matter, pre-inject the full `evaluator/` bundle and run `bash src/${PIPELINE} /workspace/task/info.json` (no flag) — Full mode bypasses the trust-boundary handoff.

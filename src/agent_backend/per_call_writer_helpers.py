@@ -70,10 +70,12 @@ def _zero_tokens() -> Dict[str, int]:
 
 def _fallback_sid8(case_name: str, call_seq: int) -> str:
     """Derive a deterministic 8-hex-char short session id when the CLI
-    doesn't expose one. Inputs include pid + monotonic_ns so two backend
-    processes in the same case don't collide."""
+    doesn't expose one. Inputs include pid + a high-resolution monotonic
+    timestamp so two backend processes in the same case don't collide.
+    Uses int(time.monotonic() * 1e9) for Python 3.6 compatibility
+    (time.monotonic_ns() is 3.7+)."""
     blob = "{}|{}|{}|{}".format(
-        case_name, call_seq, os.getpid(), time.monotonic_ns()
+        case_name, call_seq, os.getpid(), int(time.monotonic() * 1e9)
     ).encode("utf-8")
     return hashlib.sha256(blob).hexdigest()[:8]
 

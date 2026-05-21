@@ -46,7 +46,7 @@ import tempfile
 import time
 
 try:
-    from per_call_writer_helpers import (
+    from .per_call_writer_helpers import (
         next_call_id, build_call_payload, write_call,
     )
 except Exception as _exc:
