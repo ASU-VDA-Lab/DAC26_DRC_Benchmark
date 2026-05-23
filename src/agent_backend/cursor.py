@@ -31,7 +31,7 @@
 # Cursor Agent CLI backend for the unified agent dispatcher.
 #
 # This module is loaded by ``agent/agent.py`` via ``importlib.import_module``;
-# it is no longer a standalone script. The single public entry point is
+# it is not a standalone script. The single public entry point is
 # ``call_agent(prompt_text, output_path, model, workspace=None, effort=None)``
 # which returns a dict with ``status``, ``runtime_seconds``, ``tokens``,
 # ``raw_data``, and ``error`` keys for the dispatcher to forward.
@@ -75,9 +75,13 @@ def _record_call(case_name, model_name, session_id, by_model_usage,
                  started_at=None, finished_at=None):
     """Write one ${AGENT_CALLS_DIR}/<ID>.json via the shared helper.
 
-    All failures are WARN+skip; never raises. Retries once on O_EXCL
-    collision with a bumped _CALL_SEQ.
+    Opt-in: skipped silently when RECORD_TOKENS != "1". All failures are
+    WARN+skip; never raises. Retries once on O_EXCL collision with a
+    bumped _CALL_SEQ.
     """
+    if os.environ.get("RECORD_TOKENS", "0") != "1":
+        return None
+
     if next_call_id is None or build_call_payload is None or write_call is None:
         sys.stderr.write(
             "WARN: per_call_writer_helpers import failed; skipping "

@@ -193,17 +193,6 @@ echo "  workspace   : ${workspace}"
 echo ""
 
 # ---------------------------------------------------------------------------
-# Helper: write score dict from JSON to CSV
-# ---------------------------------------------------------------------------
-write_score_csv() {
-    local score_json="$1"
-    local score_csv="$2"
-    local case="$3"
-
-    "${PY:-python3}" "${evaluator_dir}/write_score_csv.py" "${score_json}" "${score_csv}" "${case}"
-}
-
-# ---------------------------------------------------------------------------
 # 4. Set up result/score directories (needed before prompt formatting)
 # ---------------------------------------------------------------------------
 result_dir="${workspace}/result/${model_name}/${design_type}/${task_type}/${case_name}"
@@ -211,12 +200,11 @@ score_dir="${workspace}/score/${model_name}/${design_type}/${task_type}"
 temp_dir="${workspace}/temp/${model_name}_${design_type}_${task_type}_${case_name}_$$"
 mkdir -p "${result_dir}" "${score_dir}" "${temp_dir}"
 
-# Per-case AGENT_CALLS_DIR; gated on phase != score. Cursor uses ${model_name} where claude/codex use ${run_id}; evaluate_cursor.sh sets run_id="${model_name}" so the host aggregator path aligns.
-# Shared flat dir across cases; scope-clean stale files for THIS
-# case only (do not rm -rf the shared calls/ tree). Parallel same-case
-# runs (same run_id/model_name/design_type/task_type/case_name tuple) on
-# the same host are caller responsibility; bump --run_id to isolate.
-if [[ "${phase}" != "score" ]]; then
+# Per-case AGENT_CALLS_DIR + AGENT_CASE_NAME are only exported when
+# per-call recording is enabled. Backends short-circuit when RECORD_TOKENS != 1.
+# Cursor uses ${model_name} where claude/codex use ${run_id}; evaluate_cursor.sh
+# sets run_id="${model_name}" so the host aggregator path aligns.
+if [[ "${RECORD_TOKENS:-0}" == "1" && "${phase}" != "score" ]]; then
     export AGENT_CALLS_DIR="${score_dir}/calls"
     export AGENT_CASE_NAME="${case_name}"
     mkdir -p "${AGENT_CALLS_DIR}"
@@ -417,32 +405,28 @@ if [[ "${task_type}" == "repair" ]]; then
     # agent_meta fail-closed guard (symmetric with the
     # detection-side guard above). score_repair.py requires --agent-meta
     # and unconditionally opens it; if the trusted meta failed to inject
-    # or agent_status is not success, write a null score JSON + CSV and
-    # skip the scorer rather than crashing the whole pipeline.
+    # or agent_status is not success, write a null score JSON and skip
+    # the scorer rather than crashing the whole pipeline.
     if [[ ! -f "${agent_meta_path}" ]]; then
         echo "agent_meta missing at ${agent_meta_path}; emitting fail-closed null repair score." >&2
-        score_csv="${score_dir}/${case_name}_score.csv"
         "${PY}" "${evaluator_dir}/write_invalid_score.py" \
             --output "${score_json}" \
             --task "${task_type}" \
             --invalid-reason "agent_meta_missing" \
-            --null-metrics --null-tokens || true
-        "${PY}" "${evaluator_dir}/write_score_csv.py" \
-            "${score_json}" "${score_csv}" "${case_name}" || true
+            --null-metrics --null-tokens \
+            --record-tokens "${RECORD_TOKENS:-0}" || true
         exit 0
     fi
     _agent_status_from_meta="$("${PY}" -c 'import json,sys; print(json.load(open(sys.argv[1])).get("agent_status","fail"))' "${agent_meta_path}" 2>/dev/null || echo fail)"
     if [[ "${_agent_status_from_meta}" != "success" ]]; then
         echo "agent_status=${_agent_status_from_meta}; emitting fail-closed null repair score." >&2
-        score_csv="${score_dir}/${case_name}_score.csv"
         "${PY}" "${evaluator_dir}/write_invalid_score.py" \
             --output "${score_json}" \
             --task "${task_type}" \
             --invalid-reason "agent_failed" \
             --null-metrics --null-tokens \
-            --agent-meta "${agent_meta_path}" || true
-        "${PY}" "${evaluator_dir}/write_score_csv.py" \
-            "${score_json}" "${score_csv}" "${case_name}" || true
+            --agent-meta "${agent_meta_path}" \
+            --record-tokens "${RECORD_TOKENS:-0}" || true
         exit 0
     fi
 
@@ -450,7 +434,9 @@ if [[ "${task_type}" == "repair" ]]; then
         --original-drc "${golden_report}" \
         --new-drc "${repaired_arg}" \
         --output "${score_json}" \
-        --agent-meta "${agent_meta_path}"
+        --agent-meta "${agent_meta_path}" \
+        --record-tokens "${RECORD_TOKENS:-0}" \
+        --num-calls "${NUM_CALLS:-0}"
 
     # --- Merge check results into score ---
     if [[ -f "${sanity_json_path}" ]]; then
@@ -463,10 +449,6 @@ if [[ "${task_type}" == "repair" ]]; then
         "${PY}" "${evaluator_dir}/merge_score_connectivity.py" \
             "${score_json}" "${connectivity_json}" || true
     fi
-
-    # --- Write CSV ---
-    score_csv="${score_dir}/${case_name}_score.csv"
-    write_score_csv "${score_json}" "${score_csv}" "${case_name}"
 
 else
 
@@ -537,15 +519,13 @@ else
             echo "agent_status=${_agent_status_from_meta}; emitting fail-closed null score." >&2
             mkdir -p "${score_dir}"
             score_json="${score_dir}/${case_name}_score.json"
-            score_csv="${score_dir}/${case_name}_score.csv"
             "${PY}" "${evaluator_dir}/write_invalid_score.py" \
                 --output "${score_json}" \
                 --task "${task_type}" \
                 --invalid-reason "agent_failed" \
                 --null-metrics --null-tokens \
-                --agent-meta "${agent_meta_path}" || true
-            "${PY}" "${evaluator_dir}/write_score_csv.py" \
-                "${score_json}" "${score_csv}" "${case_name}" || true
+                --agent-meta "${agent_meta_path}" \
+                --record-tokens "${RECORD_TOKENS:-0}" || true
             exit 0
         fi
     fi
@@ -580,36 +560,17 @@ else
         --predicted "${agent_output}" \
         --golden "${golden_report}" \
         --output "${score_json}" \
-        --agent-meta "${agent_meta_path}"
-
-    score_csv="${score_dir}/${case_name}_score.csv"
-    write_score_csv "${score_json}" "${score_csv}" "${case_name}"
+        --agent-meta "${agent_meta_path}" \
+        --record-tokens "${RECORD_TOKENS:-0}" \
+        --num-calls "${NUM_CALLS:-0}"
 
 fi
-
-# ---------------------------------------------------------------------------
-# 7. Append to logs/runtime.csv
-# ---------------------------------------------------------------------------
-log_dir="${workspace}/logs"
-mkdir -p "${log_dir}"
-runtime_csv="${log_dir}/runtime.csv"
-timestamp_now="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
-
-# NUM_CALLS: optional; defaults to 0 for legacy single-call agents.
-"${PY:-python3}" "${evaluator_dir}/log_runtime.py" \
-    "${runtime_csv}" \
-    "${model_name}" "" "${task_type}" "${design_type}" "${case_name}" \
-    "${agent_status}" \
-    "${agent_runtime_seconds}" \
-    "${tokens_json}" \
-    "${timestamp_now}" \
-    --num-calls "${NUM_CALLS:-0}"
 
 echo "  Score: ${score_json}"
 echo ""
 
 # ---------------------------------------------------------------------------
-# 8. Clean up temp directory
+# 7. Clean up temp directory
 # ---------------------------------------------------------------------------
 if [[ -d "${temp_dir}" ]]; then
     rm -rf "${temp_dir}"

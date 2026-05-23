@@ -4,9 +4,9 @@ This guide tells you exactly what you can change, what you must not change, and 
 
 ## TL;DR
 
-1. **Only edit files inside `agent/`** — everything else is frozen benchmark infrastructure. The token-recording backends now live in `src/agent_backend/` (frozen, image-baked).
+1. **Only edit files inside `agent/`** — everything else is frozen benchmark infrastructure. The token-recording backends live in `src/agent_backend/` (frozen, image-baked).
 2. **Keep these filenames at these paths** (the frozen pipeline calls them by path): `agent/agent.py`, `agent/prompt_format.py`, `agent/skill.md`, `agent/prompts/{detection,repair_cell,repair_polygon,repair_block}.json`.
-3. **`agent/agent.py` must emit `STATUS=...`, `TOKENS_JSON=...`, `RUNTIME_SECONDS=...` lines to stderr** so the host can parse them and write the trusted agent_meta JSON.
+3. **`agent/agent.py` must emit `STATUS=...` and `RUNTIME_SECONDS=...` lines to stderr** so the host can parse them and write the trusted agent_meta JSON. The `TOKENS_JSON=...` line is emitted only when `RECORD_TOKENS=1`.
 
 **Trust posture (three layers):**
 
@@ -136,6 +136,8 @@ TOKENS_JSON={"input_tokens": N, "output_tokens": N, "cache_read_tokens": N, "cac
 RUNTIME_SECONDS=12.345
 ```
 
+The `TOKENS_JSON=` line is **only emitted when `RECORD_TOKENS=1`** is set on the host (default `0` skips it). `STATUS=` and `RUNTIME_SECONDS=` are always emitted.
+
 - `STATUS` must be `success` or `fail`; anything else is coerced to `fail` by the host parser in `lib_helpers.sh` (grep `===== STATUS =====`).
 - `TOKENS_JSON` keys must be exactly those four names; extra keys are stripped.
 - `RUNTIME_SECONDS` must match `^[0-9]+(\.[0-9]+)?$`.
@@ -163,9 +165,9 @@ If your agent fails to produce output, the `--fallback` is used for repair only 
 
 ---
 
-## Per-call token recording (mandatory)
+## Per-call token recording (opt-in)
 
-During the agent phase, every backend MUST write one `${AGENT_CALLS_DIR}/<ID>.json` per successful CLI call, where `<ID>=${case_name}_${call_seq:04d}_<sha8>` (the eight-hex-char prefix of a per-call session id). The aggregator fails closed at score time when STATUS=success but zero per-call files were found, emitting an invalid score with `invalid_reason=mandatory_calls_recording_missing`.
+Per-call token recording is **opt-in** via the `RECORD_TOKENS` env var (default `0`). When `RECORD_TOKENS=1` is set on the host (`RECORD_TOKENS=1 bash src/evaluate_*.sh`), `evaluate_*.sh` propagates the value via `docker exec -e RECORD_TOKENS=1`, `run_pipeline_*.sh` exports `AGENT_CALLS_DIR` + `AGENT_CASE_NAME`, every backend writes one `${AGENT_CALLS_DIR}/<ID>.json` per CLI call, `agent/agent.py` emits the `TOKENS_JSON=` stderr marker, the host aggregator runs, and `score.json` includes the four token fields plus `num_calls`. When `RECORD_TOKENS=0` (the default) the entire pipeline is skipped and `score.json` omits those five fields.
 
 **Env vars.** During the agent phase the pipeline exports:
 
@@ -195,11 +197,9 @@ Stale files for the current case are removed with `rm -f ${AGENT_CALLS_DIR}/${ca
 
 Optional forensic fields (`session_id`, `runtime_seconds`, `started_at`, `finished_at`) are allowed but ignored by the aggregator.
 
-**Fail-closed.** When `STATUS=success` and zero `${case_name}_*.json` files exist, the aggregator exits 4 and the host writes a fail-closed null score JSON via `write_invalid_score.py --invalid-reason=mandatory_calls_recording_missing --null-tokens`. The score JSON's `valid_repair` / `valid_detection` field is `false` and `invalid_reason` is `mandatory_calls_recording_missing`.
+**Best-effort, not fail-closed.** When `RECORD_TOKENS=1` but zero `${case_name}_*.json` files exist for the case (custom backend forgot to record, or all files were corrupt), the 4 token fields and `num_calls` in `score.json` become the string sentinel `"WARN: no per-call files recorded"`. The score is still emitted; no `invalid_reason=mandatory_calls_recording_missing` is produced.
 
-When `STATUS=fail`, the `--require-files` flag is not set; the aggregator's marker fallback path is preserved verbatim.
-
-**Concurrency.** Concurrent runs of the same `(run_id, model_name, design_type, task_type, case_name)` tuple on the same host are caller responsibility — bump `model_name` or effort so the derived `run_id` differs, otherwise the second invocation's `rm -f` may clear the first's per-call files. The host no longer holds a `flock` for this; same-case parallelism on one host requires distinct `run_id` values.
+**Concurrency.** Concurrent runs of the same `(run_id, model_name, design_type, task_type, case_name)` tuple on the same host are caller responsibility — bump `model_name` or effort so the derived `run_id` differs, otherwise the second invocation's `rm -f` may clear the first's per-call files. The host does not hold a `flock` for this; same-case parallelism on one host requires distinct `run_id` values.
 
 ---
 
@@ -334,14 +334,33 @@ Cherry-pick whatever you need; unused fields stay in the JSON but never reach th
 
 ---
 
-## Should I add a new `evaluate_<my_backend>.sh`?
+## Adding a custom agent (local LLM, Gemini CLI, Kimi/OpenAI SDK, …)
 
-No. `evaluate_*.sh` lives in frozen `src/`. The existing three runners (`claude`, `codex`, `cursor`) cover the three currently supported CLI families. If your agent runs through one of those CLIs (e.g., a different prompting strategy on Claude), just use the existing runner.
+The host pipeline (`evaluate_*.sh`, `run_pipeline_*.sh`) **never parses your backend's JSON** — it only orchestrates docker + the trust-boundary handoff and reads back the canonical stderr markers your `agent.py` emits. Pointing it at a new provider is therefore three local edits inside `agent/`:
 
-If your agent does not fit any of the three (for example, a custom REST client to your own model), pick one of:
+1. **Rewrite `agent/agent.py`** to drop or extend the `_VALID_BACKENDS = ("claude","codex","cursor")` check at line 75 and dispatch your new backend name to your own logic. The simplest path is repurposing one of the three slots (e.g. `--backend cursor` → your code) so the existing `src/evaluate_cursor.sh` runs as-is. `src/agent_backend/` is frozen; do not add modules there.
+2. **Honor the four contracts unchanged** (CLI args, `STATUS=` / `TOKENS_JSON=` / `RUNTIME_SECONDS=` stderr markers, `prompt_format.py`, output-file). agent.py's sys.path bootstrap already adds `/workspace/src`, so `from agent_backend.per_call_writer_helpers import next_call_id, build_call_payload, write_call` resolves.
+3. **(Opt-in) Record one per-call JSON per LLM invocation when `RECORD_TOKENS=1`.** Read `${AGENT_CALLS_DIR}` and `${AGENT_CASE_NAME}` from env (exported by `run_pipeline_*.sh` only when `RECORD_TOKENS=1`), call `next_call_id` → `build_call_payload(..., by_model_usage={"<model>": {input_tokens, output_tokens, cache_read_tokens, cache_write_tokens}})` → `write_call`. With `RECORD_TOKENS=0` (default) backends should short-circuit recording; with `RECORD_TOKENS=1` but no recording happened, `score.json` reports the four token fields plus `num_calls` as a string sentinel — there is no fail-closed.
 
-1. **Override dispatch in `agent/agent.py`.** Add a branch in the importlib dispatch path for your new backend name. The frozen `src/agent_backend/` modules must not be edited; perform your per-call write inline in `agent/agent.py` using the shared helper `from per_call_writer_helpers import ...` (the sys.path bootstrap in `agent/agent.py` already adds `/workspace/src`).
-2. **Bypass `evaluate_*.sh`.** Invoke `run_pipeline_<x>.sh` directly per case from your own driver script. That is exactly what the runners do internally — iterate the CASES matrix and call the pipeline.
+### Token-usage mapping (provider response → canonical 4-key snake_case)
+
+| Source | Non-interactive invocation + response | Mapping → input / output / cache_read / cache_write |
+|---|---|---|
+| Google Gemini CLI (`@google/gemini-cli`) | `gemini -p "<prompt>" --output-format json` → `{"response", "stats", "error"?}`; auth `GEMINI_API_KEY` | `stats.promptTokenCount` / `stats.candidatesTokenCount` / `stats.cachedContentTokenCount` / 0 |
+| Anthropic SDK | `messages.create(...).usage` | `input_tokens` / `output_tokens` / `cache_read_input_tokens` / `cache_creation_input_tokens` |
+| OpenAI SDK | `chat.completions.create(...).usage` | `prompt_tokens` / `completion_tokens` / `prompt_tokens_details.cached_tokens` / 0 |
+| Moonshot / Kimi (OpenAI-compatible) | same call shape; `cached_tokens` often absent | `prompt_tokens` / `completion_tokens` / 0 / 0 |
+| Local LLM (vLLM, Ollama, llama.cpp; OpenAI-compatible `/v1/chat/completions`) | reachable at `http://localhost:<port>` from the agent phase (loopback bypasses iptables) | `prompt_tokens` / `completion_tokens` / 0 / 0 |
+
+For multi-model calls inside one logical invocation, pass multiple entries to `by_model_usage` keyed by free-form model id (e.g. `"gemini-2.5-pro"`, `"local/llama-3.1-70b"`); top-level totals are summed automatically. The final `TOKENS_JSON=` stderr marker your `agent.py` emits is the sum across all calls in the case.
+
+### Running evaluation with your custom flow
+
+- **Single case (smoke / debug).** Use the Quick-start in [`README.md`](./README.md). Set `--backend` to whichever slot your rewritten `agent.py` accepts; everything between `docker create` and `--score-only` stays identical.
+- **Paper-batch reproduction.** Repurpose one of `bash src/evaluate_{claude,codex,cursor}.sh` so the auth-credential mount + image selection match your provider:
+  - For a hosted CLI/SDK: pick the runner whose `AUTH_HOST`/`AUTH_CONT` resemble your credential file (e.g. point `~/.gemini/...` at the Claude-slot mount block) and let your rewritten `agent.py` interpret the `--backend cursor` (or whichever) dispatch as your provider.
+  - For a local LLM: pick `evaluate_cursor.sh` (no effort flag, smaller env block), add `--network host` to `docker create` so the container reaches `http://localhost:<port>`, and remove the credentials mount.
+- **Custom driver.** If neither runner fits, write your own driver that mirrors the steps in `README.md`'s Quick-start: the helpers (`disconnect_container_network`, `kill_leftover_processes`, `reinject_critical_binaries`, `parse_agent_stderr`, `write_trusted_agent_meta`, `aggregate_call_tokens_for_case`) are sourced from `src/lib_helpers.sh`. The Quick-start example is a working reference for one case.
 
 ---
 

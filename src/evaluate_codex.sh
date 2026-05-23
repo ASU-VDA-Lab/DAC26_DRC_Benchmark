@@ -52,6 +52,13 @@
 
 set -euo pipefail
 
+# Toggle per-call token recording. 0 (default) skips backend per-call writes,
+# the host aggregator, and the 4 token fields + num_calls in score.json.
+# 1 preserves the full per-call pipeline. Override per-invocation via env:
+#   RECORD_TOKENS=1 bash src/evaluate_codex.sh
+RECORD_TOKENS="${RECORD_TOKENS:-0}"
+echo "RECORD_TOKENS=${RECORD_TOKENS}"
+
 # ===========================================================================
 # Configuration -- edit these lists to control which runs to execute
 # ===========================================================================
@@ -227,9 +234,8 @@ for model_entry in "${MODEL_NAMES[@]}"; do
             # ---------- (7) sealed_audit dir (host-only, never mounted) ----
             sealed_audit_dir="${host_dir}/.sealed_audit/${USER:-anon}/${run_id}/${design_type}/${task_type}/${case_name}.$$"
 
-            # ---------- (8) score JSON / CSV path -------------------------
+            # ---------- (8) score JSON path -------------------------------
             score_json="${staging_score}/${run_id}/${design_type}/${task_type}/${case_name}_${task_type}_score.json"
-            score_csv="${staging_score}/${run_id}/${design_type}/${task_type}/${task_type}_score.csv"
 
             # Prevent contamination from leftover staging
             rm -rf "${runtime_root}" "${sealed_audit_dir}"
@@ -346,6 +352,7 @@ for model_entry in "${MODEL_NAMES[@]}"; do
                 if docker exec \
                     -e "CODEX_EFFORT=${codex_effort}" \
                     -e "PYTHONDONTWRITEBYTECODE=1" \
+                    -e "RECORD_TOKENS=${RECORD_TOKENS}" \
                     "${container_name}" \
                     bash src/run_pipeline_codex.sh --agent-only /workspace/task/info.json \
                     2>&1 | tee -a "${agent_stderr_log}"; then
@@ -364,71 +371,39 @@ for model_entry in "${MODEL_NAMES[@]}"; do
                     eval "$(parse_agent_stderr "${agent_stderr_log}")" \
                         || echo "WARNING: parse_agent_stderr returned non-zero (using defaults)" >&2
 
-                    # Aggregate per-call tokens; override tokens_json only when source==per_call_files.
-                    calls_dir_on_host="${host_dir}/score/${run_id}/${design_type}/${task_type}/calls"
-                    _require_flag=""
-                    if [[ "${agent_status:-fail}" == "success" ]]; then
-                        _require_flag="--require-files"
-                    fi
-                    _agg_triple="$(aggregate_call_tokens_for_case \
-                        "${calls_dir_on_host}" \
-                        "${case_name}" \
-                        "${sealed_audit_dir}/${case_name}_tokens_combined.json" \
-                        "${tokens_json}" \
-                        "${sealed_audit_dir}/${case_name}_aggregate_call_tokens.log" \
-                        "${_require_flag}")" \
-                        || _agg_triple="${tokens_json}|0|fallback_tokens"
-                    _agg_tokens="$(printf '%s' "${_agg_triple}" | awk -F'|' '{print $1}')"
-                    _agg_num="$(printf '%s'    "${_agg_triple}" | awk -F'|' '{print $2}')"
-                    _agg_source="$(printf '%s' "${_agg_triple}" | awk -F'|' '{print $3}')"
-                    if [[ "${_agg_source}" == "per_call_files" ]]; then
-                        tokens_json="${_agg_tokens}"
-                        num_calls="${_agg_num}"
-                        # Per-call file is written only on agent-success branch
-                        # in agent_backend/*.py (O_CREAT|O_EXCL). Its presence
-                        # is independent proof the agent CLI completed. If the
-                        # text-marker scrape said fail (e.g., host stderr log
-                        # truncated by a concurrent docker-daemon race), promote
-                        # status to success and rescue runtime from per-call.
-                        if [[ "${agent_status:-fail}" != "success" ]]; then
-                            echo "WARN: agent_status='${agent_status:-fail}' from stderr markers but per-call file present (n=${num_calls}); promoting to success." >&2
-                            agent_status="success"
-                            _pcf="$(find "${calls_dir_on_host}" -maxdepth 1 -type f -name "${case_name}_*.json" 2>/dev/null | sort | head -1)"
-                            if [[ -n "${_pcf}" ]]; then
-                                _rt="$(python3 -c '
-import json, sys
-from datetime import datetime
-try:
-    d = json.load(open(sys.argv[1]))
-    s = d.get("started_at"); f = d.get("finished_at")
-    if s and f:
-        ts = datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
-        tf = datetime.strptime(f, "%Y-%m-%dT%H:%M:%SZ")
-        print((tf - ts).total_seconds())
-    else:
-        print(0)
-except Exception:
-    print(0)
-' "${_pcf}" 2>/dev/null || echo 0)"
-                                if [[ "${_rt}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ "${_rt}" != "0" ]]; then
-                                    agent_runtime_seconds="${_rt}"
-                                fi
-                            fi
+                    num_calls=0
+                    if [[ "${RECORD_TOKENS}" == "1" ]]; then
+                        # Aggregate per-call tokens; override tokens_json only when source==per_call_files.
+                        calls_dir_on_host="${host_dir}/score/${run_id}/${design_type}/${task_type}/calls"
+                        _agg_triple="$(aggregate_call_tokens_for_case \
+                            "${calls_dir_on_host}" \
+                            "${case_name}" \
+                            "${sealed_audit_dir}/${case_name}_tokens_combined.json" \
+                            "${tokens_json}" \
+                            "${sealed_audit_dir}/${case_name}_aggregate_call_tokens.log")" \
+                            || _agg_triple="${tokens_json}|0|fallback_tokens"
+                        _agg_tokens="$(printf '%s' "${_agg_triple}" | awk -F'|' '{print $1}')"
+                        _agg_num="$(printf '%s'    "${_agg_triple}" | awk -F'|' '{print $2}')"
+                        _agg_source="$(printf '%s' "${_agg_triple}" | awk -F'|' '{print $3}')"
+                        if [[ "${_agg_source}" == "per_call_files" ]]; then
+                            tokens_json="${_agg_tokens}"
+                            num_calls="${_agg_num}"
+                            _promo="$(promote_status_from_per_call \
+                                "${calls_dir_on_host}" "${case_name}" \
+                                "${agent_status:-fail}" "${agent_runtime_seconds:-0}" \
+                                "${num_calls}")"
+                            agent_status="${_promo%%|*}"
+                            agent_runtime_seconds="${_promo##*|}"
                         fi
-                    elif [[ "${_agg_source}" == "mandatory_calls_recording_missing" ]]; then
-                        agent_status="fail"
-                        num_calls=0
-                    else
-                        num_calls=0
-                    fi
-                    [[ "${num_calls}" =~ ^[0-9]+$ ]] || num_calls=0
+                        [[ "${num_calls}" =~ ^[0-9]+$ ]] || num_calls=0
 
-                    # Seal per-call files for this case (filter by case_name prefix).
-                    mkdir -p "${sealed_audit_dir}/${case_name}_call_tokens"
-                    find "${calls_dir_on_host}" -maxdepth 1 -type f \
-                         -name "${case_name}_*.json" -print0 2>/dev/null \
-                        | xargs -0 -I{} cp -aP {} \
-                          "${sealed_audit_dir}/${case_name}_call_tokens/" 2>/dev/null || true
+                        # Seal per-call files for this case (filter by case_name prefix).
+                        mkdir -p "${sealed_audit_dir}/${case_name}_call_tokens"
+                        find "${calls_dir_on_host}" -maxdepth 1 -type f \
+                             -name "${case_name}_*.json" -print0 2>/dev/null \
+                            | xargs -0 -I{} cp -aP {} \
+                              "${sealed_audit_dir}/${case_name}_call_tokens/" 2>/dev/null || true
+                    fi
 
                     agent_meta_trusted="${sealed_audit_dir}/${case_name}_agent_meta.json"
                     write_trusted_agent_meta "${agent_meta_trusted}" \
@@ -469,6 +444,7 @@ except Exception:
                         -e "HARDENED_EVALUATION=1" \
                         -e "EVALUATOR_DIR=/workspace/evaluator" \
                         -e "TRUSTED_PYTHON=/usr/local/bin/python3-trusted" \
+                        -e "RECORD_TOKENS=${RECORD_TOKENS}" \
                         -e "NUM_CALLS=${num_calls:-0}" \
                         "${container_name}" \
                         bash src/run_pipeline_codex.sh --score-only /workspace/task/info.json \
@@ -484,6 +460,7 @@ except Exception:
                 if docker exec \
                     -e "CODEX_EFFORT=${codex_effort}" \
                     -e "PYTHONDONTWRITEBYTECODE=1" \
+                    -e "RECORD_TOKENS=${RECORD_TOKENS}" \
                     "${container_name}" \
                     bash src/run_pipeline_codex.sh --agent-only /workspace/task/info.json \
                     2>&1 | tee -a "${agent_stderr_log}"; then
@@ -502,71 +479,39 @@ except Exception:
                     eval "$(parse_agent_stderr "${agent_stderr_log}")" \
                         || echo "WARNING: parse_agent_stderr returned non-zero (using defaults)" >&2
 
-                    # Aggregate per-call tokens (same contract as repair branch).
-                    calls_dir_on_host="${host_dir}/score/${run_id}/${design_type}/${task_type}/calls"
-                    _require_flag=""
-                    if [[ "${agent_status:-fail}" == "success" ]]; then
-                        _require_flag="--require-files"
-                    fi
-                    _agg_triple="$(aggregate_call_tokens_for_case \
-                        "${calls_dir_on_host}" \
-                        "${case_name}" \
-                        "${sealed_audit_dir}/${case_name}_tokens_combined.json" \
-                        "${tokens_json}" \
-                        "${sealed_audit_dir}/${case_name}_aggregate_call_tokens.log" \
-                        "${_require_flag}")" \
-                        || _agg_triple="${tokens_json}|0|fallback_tokens"
-                    _agg_tokens="$(printf '%s' "${_agg_triple}" | awk -F'|' '{print $1}')"
-                    _agg_num="$(printf '%s'    "${_agg_triple}" | awk -F'|' '{print $2}')"
-                    _agg_source="$(printf '%s' "${_agg_triple}" | awk -F'|' '{print $3}')"
-                    if [[ "${_agg_source}" == "per_call_files" ]]; then
-                        tokens_json="${_agg_tokens}"
-                        num_calls="${_agg_num}"
-                        # Per-call file is written only on agent-success branch
-                        # in agent_backend/*.py (O_CREAT|O_EXCL). Its presence
-                        # is independent proof the agent CLI completed. If the
-                        # text-marker scrape said fail (e.g., host stderr log
-                        # truncated by a concurrent docker-daemon race), promote
-                        # status to success and rescue runtime from per-call.
-                        if [[ "${agent_status:-fail}" != "success" ]]; then
-                            echo "WARN: agent_status='${agent_status:-fail}' from stderr markers but per-call file present (n=${num_calls}); promoting to success." >&2
-                            agent_status="success"
-                            _pcf="$(find "${calls_dir_on_host}" -maxdepth 1 -type f -name "${case_name}_*.json" 2>/dev/null | sort | head -1)"
-                            if [[ -n "${_pcf}" ]]; then
-                                _rt="$(python3 -c '
-import json, sys
-from datetime import datetime
-try:
-    d = json.load(open(sys.argv[1]))
-    s = d.get("started_at"); f = d.get("finished_at")
-    if s and f:
-        ts = datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
-        tf = datetime.strptime(f, "%Y-%m-%dT%H:%M:%SZ")
-        print((tf - ts).total_seconds())
-    else:
-        print(0)
-except Exception:
-    print(0)
-' "${_pcf}" 2>/dev/null || echo 0)"
-                                if [[ "${_rt}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ "${_rt}" != "0" ]]; then
-                                    agent_runtime_seconds="${_rt}"
-                                fi
-                            fi
+                    num_calls=0
+                    if [[ "${RECORD_TOKENS}" == "1" ]]; then
+                        # Aggregate per-call tokens (same contract as repair branch).
+                        calls_dir_on_host="${host_dir}/score/${run_id}/${design_type}/${task_type}/calls"
+                        _agg_triple="$(aggregate_call_tokens_for_case \
+                            "${calls_dir_on_host}" \
+                            "${case_name}" \
+                            "${sealed_audit_dir}/${case_name}_tokens_combined.json" \
+                            "${tokens_json}" \
+                            "${sealed_audit_dir}/${case_name}_aggregate_call_tokens.log")" \
+                            || _agg_triple="${tokens_json}|0|fallback_tokens"
+                        _agg_tokens="$(printf '%s' "${_agg_triple}" | awk -F'|' '{print $1}')"
+                        _agg_num="$(printf '%s'    "${_agg_triple}" | awk -F'|' '{print $2}')"
+                        _agg_source="$(printf '%s' "${_agg_triple}" | awk -F'|' '{print $3}')"
+                        if [[ "${_agg_source}" == "per_call_files" ]]; then
+                            tokens_json="${_agg_tokens}"
+                            num_calls="${_agg_num}"
+                            _promo="$(promote_status_from_per_call \
+                                "${calls_dir_on_host}" "${case_name}" \
+                                "${agent_status:-fail}" "${agent_runtime_seconds:-0}" \
+                                "${num_calls}")"
+                            agent_status="${_promo%%|*}"
+                            agent_runtime_seconds="${_promo##*|}"
                         fi
-                    elif [[ "${_agg_source}" == "mandatory_calls_recording_missing" ]]; then
-                        agent_status="fail"
-                        num_calls=0
-                    else
-                        num_calls=0
-                    fi
-                    [[ "${num_calls}" =~ ^[0-9]+$ ]] || num_calls=0
+                        [[ "${num_calls}" =~ ^[0-9]+$ ]] || num_calls=0
 
-                    # Seal per-call files for this case (filter by case_name prefix).
-                    mkdir -p "${sealed_audit_dir}/${case_name}_call_tokens"
-                    find "${calls_dir_on_host}" -maxdepth 1 -type f \
-                         -name "${case_name}_*.json" -print0 2>/dev/null \
-                        | xargs -0 -I{} cp -aP {} \
-                          "${sealed_audit_dir}/${case_name}_call_tokens/" 2>/dev/null || true
+                        # Seal per-call files for this case (filter by case_name prefix).
+                        mkdir -p "${sealed_audit_dir}/${case_name}_call_tokens"
+                        find "${calls_dir_on_host}" -maxdepth 1 -type f \
+                             -name "${case_name}_*.json" -print0 2>/dev/null \
+                            | xargs -0 -I{} cp -aP {} \
+                              "${sealed_audit_dir}/${case_name}_call_tokens/" 2>/dev/null || true
+                    fi
 
                     agent_meta_trusted="${sealed_audit_dir}/${case_name}_agent_meta.json"
                     write_trusted_agent_meta "${agent_meta_trusted}" \
@@ -630,12 +575,13 @@ except Exception:
                     fi
 
                     echo "Running scoring phase..."
-                    # Score phase: HARDENED_EVALUATION=1 + NUM_CALLS for runtime.csv.
+                    # Score phase: HARDENED_EVALUATION=1, EVALUATOR_DIR, TRUSTED_PYTHON; RECORD_TOKENS toggles per-call recording; NUM_CALLS feeds --num-calls into the scorer.
                     docker exec \
                         -e "CODEX_EFFORT=${codex_effort}" \
                         -e "HARDENED_EVALUATION=1" \
                         -e "EVALUATOR_DIR=/workspace/evaluator" \
                         -e "TRUSTED_PYTHON=/usr/local/bin/python3-trusted" \
+                        -e "RECORD_TOKENS=${RECORD_TOKENS}" \
                         -e "NUM_CALLS=${num_calls:-0}" \
                         "${container_name}" \
                         bash src/run_pipeline_codex.sh --score-only /workspace/task/info.json \

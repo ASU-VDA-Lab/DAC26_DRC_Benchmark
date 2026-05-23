@@ -152,21 +152,6 @@ finalize_run() {
 }
 
 
-# mark_invalid: score-phase fail-closed; relies on vars set by caller (PY, evaluator_dir, task_type, score_json, score_csv, case_name, design_type, model_name, agent_meta_path). Always exit 0 with valid_*=false.
-mark_invalid() {
-    local reason="$1"
-    "${PY}" "${evaluator_dir}/write_invalid_score.py" \
-        --output         "${score_json}" \
-        --task           "${task_type}" \
-        --invalid-reason "${reason}" \
-        --fail-closed-zero-metrics \
-        --agent-meta     "${agent_meta_path}"
-    "${PY}" "${evaluator_dir}/write_score_csv.py" \
-        "${score_json}" "${score_csv}" "${case_name}"
-    exit 0
-}
-
-
 # parse_agent_stderr: emit shell-eval-safe assignments for agent_status / agent_runtime_seconds / tokens_json. Output is single-quoted; tokens_json is ASCII JSON with no quote chars.
 parse_agent_stderr() {
     local stderr_log="$1"
@@ -270,28 +255,24 @@ PY
 # Appends marker-vs-per-call delta WARN to <report_path> when source==per_call_files
 # and any delta is nonzero. cp -aP of the per-call files is the CALLER's job.
 # Fail-soft: any error -> <fallback_tokens_json>|1|fallback_tokens. Always returns 0.
+# Caller is responsible for gating this entire helper on RECORD_TOKENS=1.
 #
-# Args (6):
+# Args (5):
 #   1. calls_dir        - ${score_dir}/calls (flat, shared across cases)
 #   2. case_name        - case name; aggregator scopes by ${case_name}_*.json
 #   3. out_path         - aggregator --output target
 #   4. fallback_tokens  - marker tokens JSON (fail-soft path)
 #   5. report_path      - aggregator --report target
-#   6. require_flag     - "--require-files" or "" (mandatory recording)
 #
-# Exit-code convention with the aggregator:
-#   exit 0  -> success (n_valid > 0 OR --require-files not set)
-#   exit 4  -> mandatory recording required + n_valid == 0 (host emits
-#              fail-closed null score; the source field in the triple
-#              becomes "mandatory_calls_recording_missing").
-#   other   -> aggregator crash; helper falls through to marker_fallback.
+# Source values:
+#   per_call_files   - one or more valid per-call JSONs found; tokens summed.
+#   fallback_tokens  - zero valid files OR aggregator crash; marker tokens returned.
 aggregate_call_tokens_for_case() {
     local calls_dir="$1"
     local case_name="$2"
     local out_path="$3"
     local fallback_tokens="$4"
     local report_path="$5"
-    local require_flag="${6:-}"
 
     # Allow AGGREGATE_CALL_TOKENS_PY override for smoke tests.
     local agg_script="${AGGREGATE_CALL_TOKENS_PY:-${host_dir:-.}/evaluator/aggregate_call_tokens.py}"
@@ -305,33 +286,13 @@ aggregate_call_tokens_for_case() {
 
     # Stdout discarded; --output file is the canonical channel.
     local agg_rc=0
-    if [[ -n "${require_flag}" ]]; then
-        python3 "${agg_script}" \
-            --calls-dir "${calls_dir}" \
-            --case-name "${case_name}" \
-            --output   "${out_path}" \
-            --fallback-tokens-json "${fallback_tokens}" \
-            --report   "${report_path}" \
-            ${require_flag} \
-            >/dev/null 2>&1 || agg_rc=$?
-    else
-        python3 "${agg_script}" \
-            --calls-dir "${calls_dir}" \
-            --case-name "${case_name}" \
-            --output   "${out_path}" \
-            --fallback-tokens-json "${fallback_tokens}" \
-            --report   "${report_path}" \
-            >/dev/null 2>&1 || agg_rc=$?
-    fi
-
-    # Mandatory recording: aggregator exit 4 => no valid per-call files
-    # under --require-files. Caller must invoke write_invalid_score.py
-    # with invalid_reason=mandatory_calls_recording_missing instead of
-    # the normal scorer.
-    if [[ "${agg_rc}" -eq 4 ]]; then
-        printf '%s|0|mandatory_calls_recording_missing\n' "${fallback_tokens}"
-        return 0
-    fi
+    python3 "${agg_script}" \
+        --calls-dir "${calls_dir}" \
+        --case-name "${case_name}" \
+        --output   "${out_path}" \
+        --fallback-tokens-json "${fallback_tokens}" \
+        --report   "${report_path}" \
+        >/dev/null 2>&1 || agg_rc=$?
 
     # Read result via python3 -c (NEVER eval the aggregator stdout).
     local triple
@@ -358,8 +319,8 @@ try:
         print(f"{tokens_out}|{n_valid}|{source}")
     else:
         # Fail-soft: emit the marker fallback verbatim so byte-identical
-        # agent_meta.json is guaranteed for legacy single-call agents.
-        # num_calls=1 (legacy convention: one agent invocation).
+        # agent_meta.json is guaranteed for single-call agents.
+        # num_calls=1 (single agent invocation).
         print(f"{fallback}|1|{source or 'marker_fallback'}")
 except Exception:
     print(f"{fallback}|1|fallback_tokens")
@@ -420,6 +381,51 @@ except Exception:
     fi
 
     printf '%s\n' "${triple}"
+    return 0
+}
+
+
+# promote_status_from_per_call: when per-call file evidence contradicts a
+# fail/empty STATUS marker (host stderr log lost / truncated), promote
+# agent_status to "success" and rescue agent_runtime_seconds from the earliest
+# per-call JSON's started_at/finished_at. Echoes "<status>|<runtime>"; caller
+# eval/assigns. Always returns 0.
+promote_status_from_per_call() {
+    local calls_dir="$1"
+    local case_name="$2"
+    local cur_status="$3"
+    local cur_runtime="$4"
+    local n_calls="$5"
+
+    if [[ "${cur_status}" == "success" ]]; then
+        printf '%s|%s\n' "${cur_status}" "${cur_runtime}"
+        return 0
+    fi
+    echo "WARN: agent_status='${cur_status}' from stderr markers but per-call file present (n=${n_calls}); promoting to success." >&2
+    local pcf rt="${cur_runtime}"
+    pcf="$(find "${calls_dir}" -maxdepth 1 -type f -name "${case_name}_*.json" 2>/dev/null | sort | head -1)"
+    if [[ -n "${pcf}" ]]; then
+        local probed
+        probed="$(python3 -c '
+import json, sys
+from datetime import datetime
+try:
+    d = json.load(open(sys.argv[1]))
+    s = d.get("started_at"); f = d.get("finished_at")
+    if s and f:
+        ts = datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ")
+        tf = datetime.strptime(f, "%Y-%m-%dT%H:%M:%SZ")
+        print((tf - ts).total_seconds())
+    else:
+        print(0)
+except Exception:
+    print(0)
+' "${pcf}" 2>/dev/null || echo 0)"
+        if [[ "${probed}" =~ ^[0-9]+(\.[0-9]+)?$ ]] && [[ "${probed}" != "0" ]]; then
+            rt="${probed}"
+        fi
+    fi
+    printf 'success|%s\n' "${rt}"
     return 0
 }
 

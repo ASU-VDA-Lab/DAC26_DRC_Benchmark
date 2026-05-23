@@ -524,10 +524,8 @@ def validate_detection_schema(predicted):
 
 
 def main():
-    # align the CLI with the caller.
-    # token / runtime / status are always read from the trusted agent_meta
-    # JSON, no longer via CLI flags; schema validate is the first step
-    # of the main flow.
+    # token / runtime / status are read from the trusted agent_meta JSON;
+    # schema validate happens first.
     parser = argparse.ArgumentParser(description="Score DRC detection")
     parser.add_argument("--predicted",  required=True,
                         help="agent detection output JSON path")
@@ -537,47 +535,52 @@ def main():
                         help="score JSON output path")
     parser.add_argument("--agent-meta", required=True,
                         help="trusted agent_meta JSON path")
+    parser.add_argument("--record-tokens", default="0",
+                        help="When '1', emit the 4 token fields + num_calls; "
+                             "otherwise omit them. Mirrors RECORD_TOKENS env.")
+    parser.add_argument("--num-calls", type=int, default=0,
+                        help="n_call_ids_valid from the aggregator; "
+                             "emitted only when --record-tokens=1.")
     args = parser.parse_args()
 
-    # ----- Schema validate first (main flow's first step) -----
     with open(args.predicted) as f:
         predicted = json.load(f)
     is_valid, reason = validate_detection_schema(predicted)
     if not is_valid:
-        # Invariant: use write_invalid_score.py to keep the
-        # schema unified; do not emit invalid JSON from score_detection.py.
-        # Exit code 2 signals to the caller to use write_invalid_score.py.
+        # Exit 2 signals the caller to use write_invalid_score.py for a unified schema.
         sys.stderr.write(f"ERROR: detection schema invalid: {reason}\n")
         sys.exit(2)
 
-    # ----- token / runtime / status always read from trusted meta -----
     with open(args.agent_meta) as f:
         meta = json.load(f)
     agent_status        = meta.get("agent_status", "fail")
     agent_runtime_secs  = float(meta.get("agent_runtime_seconds") or 0.0)
     tokens              = meta.get("tokens") or {}
 
-    # ----- main scoring logic -----
     result = score_detection(args.predicted, args.golden)
 
-    # ----- Attach shared fields (shared score schema) -----
-    # schema validation has passed, so mark
-    # valid_detection=True for write_score_csv._pick_fields to detect the
-    # DETECTION_FIELDS schema.
+    # valid_detection=True distinguishes schema-passed output from write_invalid_score.py.
     result["valid_detection"]       = True
     result["agent_status"]          = agent_status
     result["runtime_seconds"]       = agent_runtime_secs
-    result["input_tokens"]          = int(tokens.get("input_tokens", 0))
-    result["output_tokens"]         = int(tokens.get("output_tokens", 0))
-    result["cache_read_tokens"]     = int(tokens.get("cache_read_tokens", 0))
-    result["cache_write_tokens"]    = int(tokens.get("cache_write_tokens", 0))
+    if args.record_tokens == "1":
+        if args.num_calls > 0:
+            result["input_tokens"]       = int(tokens.get("input_tokens", 0))
+            result["output_tokens"]      = int(tokens.get("output_tokens", 0))
+            result["cache_read_tokens"]  = int(tokens.get("cache_read_tokens", 0))
+            result["cache_write_tokens"] = int(tokens.get("cache_write_tokens", 0))
+            result["num_calls"]          = int(args.num_calls)
+        else:
+            _sentinel = "WARN: no per-call files recorded"
+            result["input_tokens"]       = _sentinel
+            result["output_tokens"]      = _sentinel
+            result["cache_read_tokens"]  = _sentinel
+            result["cache_write_tokens"] = _sentinel
+            result["num_calls"]          = _sentinel
 
-    # ----- Embed evaluator_hash (sha256sum-style over evaluator/*.py + *.sh).
-    # Pipeline invokes us as `python3 ${evaluator_dir}/score_detection.py ...`
-    # so sys.path[0] is the evaluator directory and the sibling import
-    # resolves. Wrap in try/except so a future import bug does not kill
-    # the whole score; an empty string makes the failure visible to
-    # readers without losing the rest of the record.
+    # Embed evaluator_hash. Pipeline invokes us as `python3 ${evaluator_dir}/score_detection.py`,
+    # so sys.path[0] is evaluator/ and the sibling import resolves. try/except so a future
+    # import bug yields an empty hash rather than killing the whole score.
     try:
         from compute_evaluator_hash import compute_evaluator_hash
         result["evaluator_hash"] = compute_evaluator_hash(
@@ -587,7 +590,6 @@ def main():
             "WARN: evaluator_hash compute failed: {!r}\n".format(_exc))
         result["evaluator_hash"] = ""
 
-    # ----- write output file (no longer prints to stdout) -----
     with open(args.output, "w") as f:
         json.dump(result, f, indent=2)
 

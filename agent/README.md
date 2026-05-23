@@ -14,7 +14,7 @@ Agent dispatcher, prompt JSON templates, and `skill.md` — the agent-side of th
 - Backend modules live in `src/agent_backend/` (frozen, image-baked). See `CUSTOM_AGENT.md` "Backend CLI invariants (frozen)".
 - `prompts/{detection,repair_cell,repair_block,repair_polygon}.json` — prompt templates (one per task).
 - `__init__.py` is an explicit empty package marker; do not switch to PEP 420 namespace packages — name collisions break the dispatcher.
-- `AGENT_CALLS_DIR` (env var, exported by `run_pipeline_*.sh` during the agent phase, set to `${score_dir}/calls/`) — flat directory where each backend writes one per-call JSON named `${case_name}_${call_seq:04d}_<sha8>.json`. The host's post-kill aggregator (`evaluator/aggregate_call_tokens.py`) sums the four-key token totals and the `by_model` breakdown, and records `num_calls` in `runtime.csv`. Per-case score JSON carries an `evaluator_hash` field. Full contract: [`../CUSTOM_AGENT.md`](../CUSTOM_AGENT.md) §"Per-call token recording".
+- `AGENT_CALLS_DIR` (env var, exported by `run_pipeline_*.sh` during the agent phase **only when `RECORD_TOKENS=1`**, set to `${score_dir}/calls/`) — flat directory where each backend writes one per-call JSON named `${case_name}_${call_seq:04d}_<sha8>.json`. The host's post-kill aggregator (`evaluator/aggregate_call_tokens.py`) sums the four-key token totals and the `by_model` breakdown, and the scorer emits the four token fields plus `num_calls` directly into `score.json`. Per-case score JSON also carries an `evaluator_hash` field. Full contract: [`../CUSTOM_AGENT.md`](../CUSTOM_AGENT.md) §"Per-call token recording".
 
 ## Trust boundary
 

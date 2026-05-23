@@ -160,8 +160,7 @@ def _parse_call_tokens(call_id, tokens_path, calls_dir_real, warnings):
         )
         return None
 
-    # schema_version: missing -> assume 1 with WARN. Unknown -> WARN +
-    # parse as v1 (legacy fail-open; per round 6 architect decision).
+    # schema_version: missing -> assume 1 with WARN. Unknown -> WARN + parse as v1 (legacy fail-open).
     sv = data.get("schema_version", None)
     if sv is None:
         warnings.append(
@@ -307,11 +306,6 @@ def main():
     parser.add_argument("--max-files", type=int, default=1024,
                         help="Maximum number of per-call files processed "
                              "(DOS cap; default 1024).")
-    parser.add_argument("--require-files", action="store_true",
-                        help="Mandatory recording: exit non-zero when zero "
-                             "valid per-call files are found. Host sets "
-                             "this when STATUS=success; omits it when "
-                             "STATUS=fail (marker_fallback path).")
     parser.add_argument("--strict", action="store_true",
                         help="Exit 3 if any WARN was emitted (unit-test use).")
     args = parser.parse_args()
@@ -478,19 +472,6 @@ def main():
         sys.stdout.write(json.dumps(payload) + "\n")
     except OSError:
         pass
-
-    # Mandatory recording fail-closed path: when --require-files is set
-    # and zero valid files were found, exit non-zero. The host helper
-    # (lib_helpers.sh::aggregate_call_tokens_for_case) intercepts this
-    # signal and writes a fail-closed null score JSON via
-    # write_invalid_score.py --invalid-reason mandatory_calls_recording_missing.
-    if args.require_files and n_valid == 0:
-        print(
-            f"ERROR: mandatory per-call recording required but no valid "
-            f"{case_name}_*.json files found under {calls_dir}",
-            file=sys.stderr,
-        )
-        sys.exit(4)
 
     if args.strict and warnings:
         sys.exit(3)

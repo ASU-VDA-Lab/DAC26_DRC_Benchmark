@@ -98,7 +98,8 @@ def _resolve_backend(cli_value):
 
 def _emit_markers(stderr, status, tokens, runtime_seconds):
     stderr.write("STATUS={}\n".format(status))
-    stderr.write("TOKENS_JSON={}\n".format(json.dumps(tokens)))
+    if os.environ.get("RECORD_TOKENS", "0") == "1":
+        stderr.write("TOKENS_JSON={}\n".format(json.dumps(tokens)))
     stderr.write("RUNTIME_SECONDS={:.3f}\n".format(runtime_seconds))
 
 

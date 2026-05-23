@@ -87,7 +87,7 @@ Run from `DAC26_DRC_Benchmark/`. Each case feeds one `info.json` (use one from [
 | Flag | Runs | When to use |
 |---|---|---|
 | `--agent-only` | Prompt format → agent call → persist `.agent_meta.json` | **Phase 1** of every paper run. |
-| `--score-only` | Render / DRC / sanity / connectivity (repair) or detection scorer → CSV + runtime log; score JSON embeds `evaluator_hash` | **Phase 2** of every paper run, after the host disconnect / kill / evaluator-inject handoff. |
+| `--score-only` | Render / DRC / sanity / connectivity (repair) or detection scorer; score JSON embeds `evaluator_hash`. When `RECORD_TOKENS=1`, the 4 token fields and `num_calls` are also embedded in `score.json`. | **Phase 2** of every paper run, after the host disconnect / kill / evaluator-inject handoff. |
 | *(none)* | Both phases back-to-back inside one container invocation | Smoke testing only — bypasses the host-side trust-boundary handoff, so scores are **not** paper-comparable. |
 
 Both repair and detection use the same `--agent-only` → handoff → `--score-only` split. The only difference: repair `docker cp`s the golden DRC report **before** the agent (legitimate input); detection does it **after** the kill / disconnect step (and `postprocess_info_json.py` rewrites `path_to_drc_report` to `""` for the agent).
@@ -117,6 +117,7 @@ AGENT_EXTRA_ENV=(-e CLAUDE_CODE_MAX_OUTPUT_TOKENS=64000)  # agent phase ONLY (Cl
 IMAGE="drc-benchmark-${TASK}"           # repair -> -repair, detection -> -detection
 NET_FLAG=(); [[ "$TASK" == "detection" ]] && NET_FLAG=(--cap-add=NET_ADMIN)
 RUN_ID="claude-sonnet-4-6-medium"       # claude / codex: ${model_name}-${effort}; cursor: ${model_name}
+RECORD_TOKENS=1                          # 1: record per-call tokens; 0 (default): skip them
 
 # Paper-grade hardening flags (mirror the `harden_flags` block in src/evaluate_claude.sh).
 # Run scripts/build_seccomp_profile.sh once on the host first; produces
@@ -184,6 +185,7 @@ reinject_critical_binaries "$CONTAINER" "$HOST_DIR" pre-kill
 # score-phase exec below.
 docker exec "${EFFORT_ENV[@]}" "${AGENT_EXTRA_ENV[@]}" \
     -e PYTHONDONTWRITEBYTECODE=1 \
+    -e "RECORD_TOKENS=${RECORD_TOKENS}" \
     "$CONTAINER" \
     bash "src/${PIPELINE}" --agent-only /workspace/task/info.json \
     2>&1 | tee "$AGENT_STDERR"
@@ -196,22 +198,18 @@ reinject_critical_binaries  "$CONTAINER" "$HOST_DIR" post-kill
 eval "$(parse_agent_stderr "$AGENT_STDERR")"
 
 # Aggregate per-call token JSONs (each backend writes one to ${score_dir}/calls/<ID>.json
-# during agent phase). Mandatory: if STATUS=success but no per-call file is found,
-# scoring fails-closed with invalid_reason=mandatory_calls_recording_missing.
-CALLS_DIR="$HOST_DIR/score/$RUN_ID/$DESIGN/$TASK/calls"
-REQ=""; [[ "$agent_status" == "success" ]] && REQ="--require-files"
-_agg=$(aggregate_call_tokens_for_case "$CALLS_DIR" "$CASE" \
-    "$SEALED_DIR/${CASE}_tokens_combined.json" "$tokens_json" \
-    "$SEALED_DIR/${CASE}_aggregate.log" "$REQ")
-_src=$(printf '%s' "$_agg" | awk -F'|' '{print $3}')
-if [[ "$_src" == "per_call_files" ]]; then
-    tokens_json=$(printf '%s' "$_agg" | awk -F'|' '{print $1}')
-    num_calls=$(printf '%s' "$_agg" | awk -F'|' '{print $2}')
-elif [[ "$_src" == "mandatory_calls_recording_missing" ]]; then
-    agent_status="fail"
-    num_calls=0
-else
-    num_calls=0
+# during agent phase). Opt-in: skipped entirely when RECORD_TOKENS != 1.
+num_calls=0
+if [[ "${RECORD_TOKENS:-0}" == "1" ]]; then
+    CALLS_DIR="$HOST_DIR/score/$RUN_ID/$DESIGN/$TASK/calls"
+    _agg=$(aggregate_call_tokens_for_case "$CALLS_DIR" "$CASE" \
+        "$SEALED_DIR/${CASE}_tokens_combined.json" "$tokens_json" \
+        "$SEALED_DIR/${CASE}_aggregate.log")
+    _src=$(printf '%s' "$_agg" | awk -F'|' '{print $3}')
+    if [[ "$_src" == "per_call_files" ]]; then
+        tokens_json=$(printf '%s' "$_agg" | awk -F'|' '{print $1}')
+        num_calls=$(printf '%s' "$_agg" | awk -F'|' '{print $2}')
+    fi
 fi
 
 write_trusted_agent_meta "$SEALED_DIR/${CASE}_agent_meta.json" \
@@ -231,11 +229,13 @@ fi
 
 # ============= Phase 2: --score-only (HARDENED_EVALUATION=1 + EVALUATOR_DIR
 # + TRUSTED_PYTHON satisfy the score-phase invariants in run_pipeline_*.sh;
-# NUM_CALLS is forwarded into the runtime.csv num_calls column). =============
+# RECORD_TOKENS toggles emission of the 4 token fields + num_calls in
+# score.json; NUM_CALLS is forwarded into the scorer's --num-calls flag). =============
 docker exec "${EFFORT_ENV[@]}" \
     -e HARDENED_EVALUATION=1 \
     -e EVALUATOR_DIR=/workspace/evaluator \
     -e TRUSTED_PYTHON=/usr/local/bin/python3-trusted \
+    -e "RECORD_TOKENS=${RECORD_TOKENS}" \
     -e "NUM_CALLS=${num_calls:-0}" \
     "$CONTAINER" \
     bash "src/${PIPELINE}" --score-only /workspace/task/info.json
@@ -244,6 +244,8 @@ docker rm -f "$CONTAINER"
 ```
 
 The block above is **Claude Code + repair** (Cell1 on the cell design). For other CLI / task combinations, the rest of the script is unchanged — just swap the knobs at the top.
+
+**Token recording is opt-in.** Set `RECORD_TOKENS=0` (the default) on the host to skip the per-call backend writes, the aggregator helper, and the 4 token fields + `num_calls` in `score.json`. With `RECORD_TOKENS=0` the same canonical script runs unchanged — the `-e "RECORD_TOKENS=${RECORD_TOKENS}"` env propagation in both `docker exec` blocks short-circuits the recording pipeline inside the container. See §"Pipeline architecture" below for the full ON/OFF behaviour matrix.
 
 **Cursor + repair** (uses [`example/cell1_repair_cursor.json`](./example/cell1_repair_cursor.json)):
 
@@ -281,7 +283,7 @@ NET_FLAG=(); [[ "$TASK" == "detection" ]] && NET_FLAG=(--cap-add=NET_ADMIN)
 RUN_ID="gpt-5.4-high"                    # codex: ${model_name}-${codex_effort}
 ```
 
-**Output locations:** `score/<run_id>/<design>/<task>/<case>_score.json` (each carries an `evaluator_hash` field), trusted `.sealed_audit/<case>/agent_meta.json`, and a per-run row appended to `logs/runtime.csv`. For prompt iteration where paper-comparable scores don't matter, pre-inject the full `evaluator/` bundle and run `bash src/${PIPELINE} /workspace/task/info.json` (no flag) — Full mode bypasses the trust-boundary handoff.
+**Output locations:** `score/<run_id>/<design>/<task>/<case>_score.json` (each carries an `evaluator_hash` field) and trusted `.sealed_audit/<case>/agent_meta.json`. No CSV outputs are produced. For prompt iteration where paper-comparable scores don't matter, pre-inject the full `evaluator/` bundle and run `bash src/${PIPELINE} /workspace/task/info.json` (no flag) — Full mode bypasses the trust-boundary handoff.
 
 ### 3. Reproduce paper experiments
 
@@ -303,10 +305,10 @@ host (evaluate_*.sh)
   -> kill leftover, network disconnect, docker cp evaluator/. + trusted_bin
   -> score phase   : embed evaluator_hash into score JSON
                      -> render (repair) -> KLayout DRC -> sanity / connectivity
-                     -> score_repair.py | score_detection.py -> CSV + runtime.csv
+                     -> score_repair.py | score_detection.py -> score.json
 ```
 
-**Per-call token recording (mandatory):** every agent backend writes one `${AGENT_CALLS_DIR}/<ID>.json` per LLM call, where `<ID>=${case_name}_${call_seq:04d}_<sha8>` (flat directory shared across cases). Each per-call JSON carries the four-key totals plus a `by_model` breakdown — Claude Code's haiku subagent tokens are recorded under their own model key. After the agent is killed, `evaluator/aggregate_call_tokens.py` (called by the host via `aggregate_call_tokens_for_case` in `src/lib_helpers.sh`) sums totals and forwards `n_call_ids_valid` to the `num_calls` column of `logs/runtime.csv`. Fail-closed: if `STATUS=success` but zero per-call files exist for the case, `write_invalid_score.py` emits a null score with `invalid_reason=mandatory_calls_recording_missing`. Central writer: `src/agent_backend/per_call_writer_helpers.py`. Full contract: [`CUSTOM_AGENT.md`](./CUSTOM_AGENT.md) §"Per-call token recording".
+**Per-call token recording (opt-in):** set `RECORD_TOKENS=1` to record one `${AGENT_CALLS_DIR}/<ID>.json` per LLM call, where `<ID>=${case_name}_${call_seq:04d}_<sha8>` (flat directory shared across cases). Each per-call JSON carries the four-key totals plus a `by_model` breakdown. After the agent is killed, `evaluator/aggregate_call_tokens.py` (called by the host via `aggregate_call_tokens_for_case` in `src/lib_helpers.sh`) sums totals and the scorer emits the 4 token fields plus `num_calls` directly into `score.json`. Best-effort: if `RECORD_TOKENS=1` but zero per-call files were recorded, the 4 token fields and `num_calls` become the string sentinel `"WARN: no per-call files recorded"`. With `RECORD_TOKENS=0` (default) the entire recording stack is skipped and the 4 token fields + `num_calls` are omitted from `score.json`. Central writer: `src/agent_backend/per_call_writer_helpers.py`. Full contract: [`CUSTOM_AGENT.md`](./CUSTOM_AGENT.md) §"Per-call token recording".
 
 Step-level details live in [`src/README.md`](./src/README.md); trusted-bundle internals in [`evaluator/README.md`](./evaluator/README.md).
 
