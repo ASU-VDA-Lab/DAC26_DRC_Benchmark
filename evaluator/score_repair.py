@@ -162,8 +162,7 @@ def _serialize_result(result: dict) -> dict:
 
 def _zero_repair_result() -> dict:
     # Placeholder result for runs where no repaired report exists (e.g. the
-    # repair failed to render a GDS).  Mirrors the legacy inline JSON that
-    # the shell pipeline used to emit in that situation.
+    # repair failed to render a GDS).
     return {
         "repair_rate": 0,
         "new_violation_rate": "inf",
@@ -177,9 +176,7 @@ def _zero_repair_result() -> dict:
 
 
 def main():
-    # align the CLI with the caller.
-    # token / runtime / status are always read from the trusted agent_meta
-    # JSON, no longer via CLI flags.
+    # token / runtime / status are read from the trusted agent_meta JSON.
     parser = argparse.ArgumentParser(description="Score DRC repair")
     parser.add_argument("--original-drc",  required=True,
                         help="trusted original DRC report path")
@@ -189,6 +186,12 @@ def main():
                         help="score JSON output path")
     parser.add_argument("--agent-meta",    required=True,
                         help="trusted agent_meta JSON path")
+    parser.add_argument("--record-tokens", default="0",
+                        help="When '1', emit the 4 token fields + num_calls; "
+                             "otherwise omit them. Mirrors RECORD_TOKENS env.")
+    parser.add_argument("--num-calls", type=int, default=0,
+                        help="n_call_ids_valid from the aggregator; "
+                             "emitted only when --record-tokens=1.")
     args = parser.parse_args()
 
     # ----- token / runtime / status always read from trusted meta -----
@@ -204,18 +207,37 @@ def main():
     else:
         result = score_repair(args.original_drc, args.new_drc)
 
-    # ----- Attach shared fields (shared score schema) -----
-    # repair score happy-path marks valid_repair=True so
-    # write_score_csv._pick_fields can detect the REPAIR_FIELDS schema.
+    # valid_repair=True distinguishes the happy path from write_invalid_score.py output.
     result["valid_repair"]          = True
     result["agent_status"]          = agent_status
     result["runtime_seconds"]       = agent_runtime_secs
-    result["input_tokens"]          = int(tokens.get("input_tokens", 0))
-    result["output_tokens"]         = int(tokens.get("output_tokens", 0))
-    result["cache_read_tokens"]     = int(tokens.get("cache_read_tokens", 0))
-    result["cache_write_tokens"]    = int(tokens.get("cache_write_tokens", 0))
+    if args.record_tokens == "1":
+        if args.num_calls > 0:
+            result["input_tokens"]       = int(tokens.get("input_tokens", 0))
+            result["output_tokens"]      = int(tokens.get("output_tokens", 0))
+            result["cache_read_tokens"]  = int(tokens.get("cache_read_tokens", 0))
+            result["cache_write_tokens"] = int(tokens.get("cache_write_tokens", 0))
+            result["num_calls"]          = int(args.num_calls)
+        else:
+            _sentinel = "WARN: no per-call files recorded"
+            result["input_tokens"]       = _sentinel
+            result["output_tokens"]      = _sentinel
+            result["cache_read_tokens"]  = _sentinel
+            result["cache_write_tokens"] = _sentinel
+            result["num_calls"]          = _sentinel
 
-    # ----- write output file (no longer prints to stdout) -----
+    # Embed evaluator_hash. Pipeline invokes us as `python3 ${evaluator_dir}/score_repair.py`,
+    # so sys.path[0] is evaluator/ and the sibling import resolves. try/except so a future
+    # import bug yields an empty hash rather than killing the whole score.
+    try:
+        from compute_evaluator_hash import compute_evaluator_hash
+        result["evaluator_hash"] = compute_evaluator_hash(
+            os.path.dirname(os.path.abspath(__file__)))
+    except Exception as _exc:
+        sys.stderr.write(
+            "WARN: evaluator_hash compute failed: {!r}\n".format(_exc))
+        result["evaluator_hash"] = ""
+
     with open(args.output, "w") as f:
         json.dump(_serialize_result(result), f, indent=2)
 

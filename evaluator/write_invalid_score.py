@@ -49,6 +49,7 @@
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional
@@ -180,6 +181,7 @@ def _build_record(
     null_metrics: bool,
     null_tokens: bool,
     agent_meta: Dict[str, Any],
+    record_tokens: bool,
 ) -> Dict[str, Any]:
     """Build the fail-closed result dict from task and flags."""
     if task == "repair":
@@ -216,21 +218,22 @@ def _build_record(
         except (TypeError, ValueError):
             record["runtime_seconds"] = 0.0
 
-    if null_tokens:
-        record["input_tokens"] = None
-        record["output_tokens"] = None
-        record["cache_read_tokens"] = None
-        record["cache_write_tokens"] = None
-    else:
-        tokens = agent_meta.get("tokens", {}) or {}
-        if not isinstance(tokens, dict):
-            tokens = {}
-        for key in ("input_tokens", "output_tokens",
-                    "cache_read_tokens", "cache_write_tokens"):
-            try:
-                record[key] = int(tokens.get(key, 0) or 0)
-            except (TypeError, ValueError):
-                record[key] = 0
+    if record_tokens:
+        if null_tokens:
+            record["input_tokens"] = None
+            record["output_tokens"] = None
+            record["cache_read_tokens"] = None
+            record["cache_write_tokens"] = None
+        else:
+            tokens = agent_meta.get("tokens", {}) or {}
+            if not isinstance(tokens, dict):
+                tokens = {}
+            for key in ("input_tokens", "output_tokens",
+                        "cache_read_tokens", "cache_write_tokens"):
+                try:
+                    record[key] = int(tokens.get(key, 0) or 0)
+                except (TypeError, ValueError):
+                    record[key] = 0
     return record
 
 
@@ -254,6 +257,10 @@ def main() -> int:
                    help="emit 0 (or 'inf') for all task metric fields")
     ap.add_argument("--null-tokens", action="store_true",
                     help="emit null for all 4 token fields")
+    ap.add_argument("--record-tokens", default="0",
+                    help="When '1', emit the 4 token fields (null or int per "
+                         "--null-tokens). Otherwise the 4 token fields are "
+                         "omitted from the output JSON.")
     args = ap.parse_args()
 
     # Default behaves like --fail-closed-zero-metrics (when neither
@@ -267,7 +274,20 @@ def main() -> int:
         null_metrics=null_metrics,
         null_tokens=args.null_tokens,
         agent_meta=agent_meta,
+        record_tokens=(args.record_tokens == "1"),
     )
+
+    # Embed evaluator_hash. Pipeline invokes us as `python3 ${evaluator_dir}/write_invalid_score.py`,
+    # so sibling import resolves via sys.path[0]. try/except so an import bug never kills the
+    # fail-closed handler; empty hash makes the failure visible.
+    try:
+        from compute_evaluator_hash import compute_evaluator_hash
+        record["evaluator_hash"] = compute_evaluator_hash(
+            os.path.dirname(os.path.abspath(__file__)))
+    except Exception as _exc:
+        sys.stderr.write(
+            "WARN: evaluator_hash compute failed: {!r}\n".format(_exc))
+        record["evaluator_hash"] = ""
 
     out_path = Path(args.output)
     try:

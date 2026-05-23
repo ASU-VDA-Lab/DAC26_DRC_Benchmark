@@ -31,17 +31,28 @@
 # Cursor Agent CLI backend for the unified agent dispatcher.
 #
 # This module is loaded by ``agent/agent.py`` via ``importlib.import_module``;
-# it is no longer a standalone script. The single public entry point is
+# it is not a standalone script. The single public entry point is
 # ``call_agent(prompt_text, output_path, model, workspace=None, effort=None)``
 # which returns a dict with ``status``, ``runtime_seconds``, ``tokens``,
 # ``raw_data``, and ``error`` keys for the dispatcher to forward.
 
+import datetime
 import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 import time
+
+try:
+    from .per_call_writer_helpers import (
+        next_call_id, build_call_payload, write_call,
+    )
+except Exception as _exc:
+    next_call_id = None
+    build_call_payload = None
+    write_call = None
 
 AGENT_CMD = "agent"
 LONG_PROMPT_THRESHOLD = 100000
@@ -54,6 +65,78 @@ def _zero_tokens():
         "cache_read_tokens": 0,
         "cache_write_tokens": 0,
     }
+
+
+def _iso_utc():
+    return datetime.datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _record_call(case_name, model_name, session_id, by_model_usage,
+                 started_at=None, finished_at=None):
+    """Write one ${AGENT_CALLS_DIR}/<ID>.json via the shared helper.
+
+    Opt-in: skipped silently when RECORD_TOKENS != "1". All failures are
+    WARN+skip; never raises. Retries once on O_EXCL collision with a
+    bumped _CALL_SEQ.
+    """
+    if os.environ.get("RECORD_TOKENS", "0") != "1":
+        return None
+
+    if next_call_id is None or build_call_payload is None or write_call is None:
+        sys.stderr.write(
+            "WARN: per_call_writer_helpers import failed; skipping "
+            "per-call recording\n")
+        return None
+
+    calls_dir = os.environ.get("AGENT_CALLS_DIR", "").strip()
+    if not calls_dir:
+        sys.stderr.write(
+            "WARN: AGENT_CALLS_DIR unset; skipping per-call recording\n")
+        return None
+
+    try:
+        os.makedirs(calls_dir, exist_ok=True)
+    except OSError as exc:
+        sys.stderr.write(
+            "WARN: cannot mkdir AGENT_CALLS_DIR={!r}: {!r}\n".format(
+                calls_dir, exc))
+        return None
+
+    case = case_name or "unknown"
+    try:
+        cid = next_call_id(case, session_id)
+        payload = build_call_payload(
+            case_name=case,
+            call_id=cid,
+            model_name=model_name,
+            by_model_usage=by_model_usage,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
+    except (TypeError, ValueError) as exc:
+        sys.stderr.write(
+            "WARN: per-call payload build failed: {!r}\n".format(exc))
+        return None
+
+    try:
+        return write_call(calls_dir, cid, payload)
+    except FileExistsError:
+        try:
+            cid = next_call_id(case, session_id)
+            payload["call_id"] = cid
+            return write_call(calls_dir, cid, payload)
+        except FileExistsError:
+            sys.stderr.write(
+                "WARN: O_EXCL collision on retry; skipping per-call\n")
+            return None
+        except OSError as exc:
+            sys.stderr.write(
+                "WARN: per-call write retry failed: {!r}\n".format(exc))
+            return None
+    except OSError as exc:
+        sys.stderr.write(
+            "WARN: per-call write failed: {!r}\n".format(exc))
+        return None
 
 
 def _invoke_cli(prompt_text, model_name, workspace=None):
@@ -143,6 +226,7 @@ def call_agent(prompt_text, output_path, model, workspace=None, effort=None):
             ),
         }
 
+    started_at = _iso_utc()
     t_start = time.monotonic()
     try:
         tokens, raw_data = _invoke_cli(
@@ -150,6 +234,19 @@ def call_agent(prompt_text, output_path, model, workspace=None, effort=None):
             workspace=workspace,
         )
         elapsed = time.monotonic() - t_start
+        finished_at = _iso_utc()
+        # cursor CLI does not expose per-model usage; emit a single-entry
+        # by_model keyed by the --model arg.
+        by_model = {str(model): tokens}
+        case_name = os.environ.get("AGENT_CASE_NAME", "").strip() or None
+        _record_call(
+            case_name=case_name,
+            model_name=model,
+            session_id=None,
+            by_model_usage=by_model,
+            started_at=started_at,
+            finished_at=finished_at,
+        )
         return {
             "status": "success",
             "runtime_seconds": elapsed,

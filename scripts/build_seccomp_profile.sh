@@ -49,8 +49,8 @@
 #       https://raw.githubusercontent.com/moby/moby/v24.0.7/profiles/seccomp/default.json
 #   sha256sum docker/seccomp-default.json > docker/seccomp-default.json.sha256
 # Reason for pinning v24.0.7: moby main branch keeps patching the syscall
-# list; pinning the tag keeps the plan's syscall set consistent with the base
-# profile. Upgrading requires a separate review round to sync extra rules.
+# list; pinning the tag keeps the syscall set consistent with the base
+# profile. Upgrading requires a separate review to sync extra rules.
 #
 # If docker/seccomp-default.json is missing, this script fails and prompts to
 # download it first.

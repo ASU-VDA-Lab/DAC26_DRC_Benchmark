@@ -37,14 +37,12 @@
 # Score phase
 # docker cp these binaries into the container as
 #   /usr/local/bin/{bash,python3,sha256sum}-trusted
-# so that score-phase docker exec no longer relies on the (potentially
+# so that score-phase docker exec does not rely on the (potentially
 # tampered) on-disk copies that agent phase root could have rewritten.
 #
-# Idempotency: re-running this script overwrites the previous binaries with
+# Idempotency: re-running this script overwrites the existing binaries with
 # bit-identical bytes when the source image is unchanged, so .hash stays
 # stable across runs.
-#
-# Reference: project planning notes (see git history).
 
 set -euo pipefail
 
