@@ -289,11 +289,15 @@ RUN_ID="gpt-5.4-high"                    # codex: ${model_name}-${codex_effort}
 
 `evaluate_cursor.sh` (Cursor), `evaluate_claude.sh` (Claude Code), and `evaluate_codex.sh` (Codex) reproduce the experiments in the paper. They automate `info.json` generation, Docker container lifecycle, and golden DRC report injection across all task / model / case combinations. Edit the `CASES` array in the script to control which cases are swept.
 
+**To match the paper's score JSON (with token counts and per-call breakdown), set `RECORD_TOKENS=1`** — token recording is opt-in (default off):
+
 ```bash
-bash src/evaluate_cursor.sh          # Cursor Agent CLI
-bash src/evaluate_claude.sh          # Claude Code CLI
-bash src/evaluate_codex.sh           # Codex CLI
+RECORD_TOKENS=1 bash src/evaluate_cursor.sh   # Cursor Agent CLI
+RECORD_TOKENS=1 bash src/evaluate_claude.sh   # Claude Code CLI
+RECORD_TOKENS=1 bash src/evaluate_codex.sh    # Codex CLI
 ```
+
+Without `RECORD_TOKENS=1`, the runs still produce a valid `*_score.json` per case (with `agent_status`, `valid_*`, metrics, and `evaluator_hash`) — only the four token fields, `num_calls`, and the per-call `calls/` subdirectory are skipped.
 
 ## Pipeline architecture
 
