@@ -32,9 +32,11 @@
 #
 # This module is loaded by ``agent/agent.py`` via ``importlib.import_module``;
 # it is not a standalone script. The single public entry point is
-# ``call_agent(prompt_text, output_path, model, workspace=None, effort=None)``
-# which returns a dict with ``status``, ``runtime_seconds``, ``tokens``,
-# ``raw_data``, and ``error`` keys for the dispatcher to forward.
+# ``call_agent(prompt_text, output_path, model, workspace=None, effort=None,
+# call_id=None, temp_dir=None)`` which returns a dict with ``status``,
+# ``runtime_seconds``, ``tokens``, ``raw_data``, and ``error`` keys for the
+# dispatcher to forward. ``call_id`` / ``temp_dir`` are optional per-leaf
+# dispatch hooks; omitting them keeps the reference single-shot behaviour.
 
 import datetime
 import json
@@ -72,12 +74,20 @@ def _iso_utc():
 
 
 def _record_call(case_name, model_name, session_id, by_model_usage,
-                 started_at=None, finished_at=None):
+                 started_at=None, finished_at=None, external_call_id=None):
     """Write one ${AGENT_CALLS_DIR}/<ID>.json via the shared helper.
 
     Opt-in: skipped silently when RECORD_TOKENS != "1". All failures are
-    WARN+skip; never raises. Retries once on O_EXCL collision with a
-    bumped _CALL_SEQ.
+    WARN+skip; never raises.
+
+    When ``external_call_id`` is supplied (per-leaf dispatch), it is used
+    verbatim as the call_id / filename and MUST be unique per case; on the
+    (by-construction near-impossible) O_EXCL collision we WARN+skip rather
+    than bump a shared counter, so parallel dispatch never races the
+    module-level _CALL_SEQ. When ``external_call_id`` is None (the
+    reference single-shot path) the id is derived from
+    ``next_call_id(case, session_id)`` and a single O_EXCL collision is
+    retried with a fresh next_call_id -- byte-identical to prior behaviour.
     """
     if os.environ.get("RECORD_TOKENS", "0") != "1":
         return None
@@ -103,8 +113,12 @@ def _record_call(case_name, model_name, session_id, by_model_usage,
         return None
 
     case = case_name or "unknown"
+    use_external = bool(external_call_id)
     try:
-        cid = next_call_id(case, session_id)
+        if use_external:
+            cid = str(external_call_id)
+        else:
+            cid = next_call_id(case, session_id)
         payload = build_call_payload(
             case_name=case,
             call_id=cid,
@@ -121,6 +135,13 @@ def _record_call(case_name, model_name, session_id, by_model_usage,
     try:
         return write_call(calls_dir, cid, payload)
     except FileExistsError:
+        if use_external:
+            # External id is unique by construction; a collision means the
+            # call was already recorded. Do NOT bump the shared counter.
+            sys.stderr.write(
+                "WARN: per-call file {!r} already exists; skipping\n".format(
+                    cid))
+            return None
         try:
             cid = next_call_id(case, session_id)
             payload["call_id"] = cid
@@ -139,8 +160,13 @@ def _record_call(case_name, model_name, session_id, by_model_usage,
         return None
 
 
-def _invoke_cli(prompt_text, model_name, workspace=None):
+def _invoke_cli(prompt_text, model_name, workspace=None, call_id=None):
     # Invoke the Cursor Agent CLI with --output-format json and no timeout.
+    #
+    # The heavy "result" key is popped from raw_data ONLY when ``call_id`` is
+    # None (reference single-shot path); when ``call_id`` is supplied (per-leaf
+    # dispatch) "result" is RETAINED so clear_next/patch_parser can extract the
+    # fenced ```json patch envelope from it.
 
     base_cmd = [
         AGENT_CMD,
@@ -198,12 +224,17 @@ def _invoke_cli(prompt_text, model_name, workspace=None):
     }
 
     raw_data = dict(data)
-    raw_data.pop("result", None)
+    # Keep "result" for per-leaf dispatch (call_id supplied) so patch_parser
+    # can read the fenced patch; pop it for the reference single-shot path
+    # (call_id None) to stay byte-identical with prior --raw-json-out output.
+    if call_id is None:
+        raw_data.pop("result", None)
 
     return tokens, raw_data
 
 
-def call_agent(prompt_text, output_path, model, workspace=None, effort=None):
+def call_agent(prompt_text, output_path, model, workspace=None, effort=None,
+               call_id=None, temp_dir=None):
     # Unified backend entry point. Invokes the Cursor Agent CLI and reports
     # status / runtime / tokens / raw_data via a single dict so the dispatcher
     # can emit stderr markers without backend-specific knowledge.
@@ -211,8 +242,16 @@ def call_agent(prompt_text, output_path, model, workspace=None, effort=None):
     # ``effort`` is accepted for API uniformity; the Cursor Agent CLI does not
     # expose a reasoning-effort flag and the value is ignored. ``output_path``
     # is similarly accepted for uniformity (the CLI writes the file itself).
+    #
+    # ``call_id`` (per-leaf dispatch): when supplied, it is used verbatim as
+    # the deterministic per-call filename for the single canonical write at
+    # ${AGENT_CALLS_DIR}/<call_id>.json. When None, the id is derived from
+    # next_call_id(...) -- byte-identical to the reference single-shot path.
+    # ``temp_dir`` is accepted for API/back-compat but is advisory only;
+    # this backend performs exactly ONE canonical per-call write.
 
     del effort  # unused
+    del temp_dir  # advisory only; single canonical write is AGENT_CALLS_DIR
 
     if shutil.which(AGENT_CMD) is None:
         return {
@@ -232,6 +271,7 @@ def call_agent(prompt_text, output_path, model, workspace=None, effort=None):
         tokens, raw_data = _invoke_cli(
             prompt_text, model,
             workspace=workspace,
+            call_id=call_id,
         )
         elapsed = time.monotonic() - t_start
         finished_at = _iso_utc()
@@ -246,6 +286,7 @@ def call_agent(prompt_text, output_path, model, workspace=None, effort=None):
             by_model_usage=by_model,
             started_at=started_at,
             finished_at=finished_at,
+            external_call_id=call_id,
         )
         return {
             "status": "success",

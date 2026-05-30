@@ -83,6 +83,12 @@ def _fallback_sid8(case_name: str, call_seq: int) -> str:
 def next_call_id(case_name: str, session_id: Optional[str]) -> str:
     """Increment _CALL_SEQ and return a new call_id.
 
+    Used only by the reference single-shot path. Per-leaf dispatch instead
+    supplies its OWN deterministic, unique call_id (e.g.
+    ``Block5_w000_l0000``) which a backend uses verbatim as the filename --
+    such callers never invoke this function, so the module-level _CALL_SEQ
+    is not shared/raced across parallel dispatch threads.
+
     Format: ``${case_name}_${call_seq:04d}_${short_session_id8}``.
 
     Constraint: total length is held to ``<= 64`` so the canonical
@@ -186,9 +192,13 @@ def write_call(calls_dir: str, call_id: str, payload: Dict[str, Any]) -> Optiona
     """Write payload to ``${calls_dir}/${call_id}.json`` via O_CREAT|O_EXCL.
 
     Returns absolute path written on success, ``None`` on any non-collision
-    failure. ``FileExistsError`` is re-raised — the caller is expected to
-    increment _CALL_SEQ via a fresh ``next_call_id`` and retry once
-    (per the policy in CUSTOM_AGENT.md).
+    failure. ``FileExistsError`` is re-raised — the caller decides how to
+    handle a collision: the single-shot path increments _CALL_SEQ via a
+    fresh ``next_call_id`` and retries once (per CUSTOM_AGENT.md); a caller
+    that passed an EXTERNALLY supplied deterministic ``call_id`` (used
+    verbatim as the filename) must keep that id unique per case and treats a
+    collision as already-recorded (WARN+skip, no counter bump). The O_EXCL
+    open makes concurrent writers to distinct call_ids fully race-free.
     """
     target = os.path.abspath(os.path.join(calls_dir, "{}.json".format(call_id)))
     # Use 'x' mode = O_CREAT | O_EXCL — atomic, no overwrite.
