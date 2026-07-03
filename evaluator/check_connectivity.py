@@ -109,18 +109,18 @@ BLOCK_METAL_ABOVE_VIA = {b: v for b, v, a in BLOCK_STACK}
 RE_CELL_TOP = re.compile(
     r'^top_cell\s*=\s*layout\.create_cell\("([^"]+)"\)')
 RE_CELL_POLY_START = re.compile(
-    r'^(polygon_\S+)\s*=\s*pya\.Polygon\(\[')
+    r'^(\w+)\s*=\s*pya\.Polygon\(\[')
 RE_CELL_POINT = re.compile(
     r'pya\.Point\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)')
 RE_CELL_INSERT = re.compile(
     r'^top_cell\.shapes\(layout\.layer\(pya\.LayerInfo\('
-    r'\s*(\d+)\s*,\s*(\d+)\s*\)\)\)\.insert\((polygon_\S+)\)')
+    r'\s*(\d+)\s*,\s*(\d+)\s*\)\)\)\.insert\((\w+)\)')
 
 # Block
 RE_BLK_CREATE_CELL = re.compile(
     r'^(\w+)\s*=\s*layout\.create_cell\("([^"]+)"\)')
 RE_BLK_POLY_DEF = re.compile(
-    r'^(p\d+)\s*=\s*pya\.Polygon\((.+)\)')
+    r'^(\w+)\s*=\s*pya\.Polygon\((.+)\)')
 RE_BLK_POINT = re.compile(
     r'pya\.Point\(\s*(-?\d+)\s*,\s*(-?\d+)\s*\)')
 RE_BLK_SHAPE_INSERT = re.compile(
