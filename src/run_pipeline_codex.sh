@@ -210,6 +210,10 @@ result_dir="${workspace}/result/${run_id}/${design_type}/${task_type}/${case_nam
 score_dir="${workspace}/score/${run_id}/${design_type}/${task_type}"
 temp_dir="${workspace}/temp/${run_id}_${design_type}_${task_type}_${case_name}_$$"
 mkdir -p "${result_dir}" "${score_dir}" "${temp_dir}"
+# Raw backend JSON dumps go to a NON-bind-mounted in-container path so they
+# never leak to the host (the only bind mounts are agent:ro/result/score/
+# logs/temp; /tmp is none of those, and is gone on --rm).
+mkdir -p /tmp/agent_raw
 
 # Per-case AGENT_CALLS_DIR + AGENT_CASE_NAME are only exported when
 # per-call recording is enabled. Backends short-circuit when RECORD_TOKENS != 1.
@@ -291,7 +295,7 @@ if [[ "${task_type}" == "repair" ]]; then
             --workspace "${workspace}" \
             --temp_dir "${temp_dir}" \
             --fallback "${original_script}" \
-            --raw-json-out "${score_dir}/${case_name}_agent_raw.json" \
+            --raw-json-out "/tmp/agent_raw/${case_name}_agent_raw.json" \
             --effort "${codex_effort}" \
             2>"${agent_stderr_tmp}" || true
         cat "${agent_stderr_tmp}" >&2
@@ -482,7 +486,7 @@ else
             --task_type "detection" \
             --workspace "${workspace}" \
             --temp_dir "${temp_dir}" \
-            --raw-json-out "${score_dir}/${case_name}_agent_raw.json" \
+            --raw-json-out "/tmp/agent_raw/${case_name}_agent_raw.json" \
             --effort "${codex_effort}" \
             2>"${agent_stderr_tmp}" || true
         cat "${agent_stderr_tmp}" >&2
