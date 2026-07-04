@@ -1,3 +1,1 @@
-version https://git-lfs.github.com/spec/v1
-oid sha256:377e96d9304a3e91119a58155becca958b4dc286c203ea2917ebeadba183db1c
-size 56
+#!/usr/bin/coreutils --coreutils-prog-shebang=sha256sum
