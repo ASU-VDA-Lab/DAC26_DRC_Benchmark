@@ -50,8 +50,8 @@ set -euo pipefail
 # Resolve image tags. Defaults match evaluate_*.sh ${DETECTION_IMAGE:-...} /
 # ${REPAIR_IMAGE:-...}; CI / dev can override via env.
 # ---------------------------------------------------------------------------
-IMAGE_DETECTION="${DETECTION_IMAGE:-drc-benchmark-detection:hardened}"
-IMAGE_REPAIR="${REPAIR_IMAGE:-drc-benchmark-repair:hardened}"
+IMAGE_DETECTION="${DETECTION_IMAGE:-drc-benchmark-detection}"
+IMAGE_REPAIR="${REPAIR_IMAGE:-drc-benchmark-repair}"
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd -- "${SCRIPT_DIR}/.." && pwd)"
