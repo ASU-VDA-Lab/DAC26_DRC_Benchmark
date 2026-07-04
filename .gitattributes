@@ -1,5 +1,5 @@
-evaluator/trusted_bin/bash filter=lfs diff=lfs merge=lfs -text
-evaluator/trusted_bin/python3 filter=lfs diff=lfs merge=lfs -text
-evaluator/trusted_bin/sha256sum filter=lfs diff=lfs merge=lfs -text
+evaluator/trusted_bin/bash      -text
+evaluator/trusted_bin/python3   -text
+evaluator/trusted_bin/sha256sum -text
 evaluator/*.py text eol=lf
 evaluator/*.sh text eol=lf
