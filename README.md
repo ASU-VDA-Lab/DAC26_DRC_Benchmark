@@ -2,6 +2,10 @@
 
 Benchmark for evaluating LLMs on ASAP7 KLayout DRC repair and detection inside a self-contained Docker container.
 
+## Release
+
+[![GitHub tag](https://img.shields.io/github/v/tag/ASU-VDA-Lab/DAC26_DRC_Benchmark)](https://github.com/ASU-VDA-Lab/DAC26_DRC_Benchmark/tree/v1)
+
 Two tasks are evaluated:
 
 - **Detection** — the agent sees a layout (a KLayout Python script) **without** the golden DRC report, and must predict which design rules are violated and where (edge pairs for spacing rules, bounding boxes otherwise). Scored against the golden DRC report by Hopcroft–Karp maximum bipartite matching per rule (Precision / Recall / F1).
