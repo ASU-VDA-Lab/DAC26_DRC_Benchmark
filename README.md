@@ -4,9 +4,9 @@ Benchmark for evaluating LLMs on ASAP7 KLayout DRC repair and detection inside a
 
 ## Release
 
-[![GitHub tag](https://img.shields.io/github/v/tag/ASU-VDA-Lab/DAC26_DRC_Benchmark)](https://github.com/ASU-VDA-Lab/DAC26_DRC_Benchmark/tree/v1) v1
+[![GitHub tag](https://img.shields.io/badge/tag-v1-blue)](https://github.com/ASU-VDA-Lab/DAC26_DRC_Benchmark/tree/v1) v1
 
-[![GitHub tag](https://img.shields.io/github/v/tag/bingyuew/DAC26_DRC_Benchmark)](https://github.com/ASU-VDA-Lab/DAC26_DRC_Benchmark/tree/v2) Fix OpenROAD pdngen issue causing ASAP7 PDN via structure DRC violations. Refer to [change log](./change_log_v2.md) for details.
+[![GitHub tag](https://img.shields.io/badge/tag-v2-blue)](https://github.com/ASU-VDA-Lab/DAC26_DRC_Benchmark/tree/v2) Fix OpenROAD pdngen issue causing ASAP7 PDN via structure DRC violations. Refer to [change log](./change_log_v2.md) for details.
 
 Two tasks are evaluated:
 
