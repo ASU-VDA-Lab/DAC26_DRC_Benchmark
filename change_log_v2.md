@@ -2,8 +2,6 @@
 
 Update the block-level benchmarks to remove DRC-violating power grid via structures introduced by OpenROAD-flow-scripts. The following shows the DRC type coverage and DRC changes for each block-level design.
 
-## Comparison Scope
-
 ## DRC Type Coverage
 
 There are 49 M1-M5 DRC rule types that OpenROAD drt module does not support. The table below shows the coverage of these DRC rule types for each updated block-level design.
@@ -84,11 +82,11 @@ The following table is the complete 49 DRC rule types that OpenROAD drt module d
 | `M1.S.6` | 0 | 12 | +12 | Added |
 | `M2.S.7` | 1 | 5 | +4 | Increased |
 | `M3.S.2` | 2 | 0 | -2 | Removed |
-| `M4.AUX.1` | 18 | 104 | +86 | Increased |
+| `M4.AUX.1` | 18 | 26 | +8 | Increased |
 | `M4.AUX.2` | 2 | 0 | -2 | Removed |
 | `M4.S.4` | 0 | 1 | +1 | Added |
 | `M4.S.5` | 4 | 2 | -2 | Decreased |
-| `M5.AUX.1` | 8 | 16 | +8 | Increased |
+| `M5.AUX.1` | 8 | 8 | 0 | Unchanged |
 | `M6.AUX.1` | 3 | 0 | -3 | Removed |
 | `V0.M1.AUX.3` | 37 | 25 | -12 | Decreased |
 | `V1.M1.EN.1` | 11 | 30 | +19 | Increased |
@@ -102,10 +100,10 @@ The following table is the complete 49 DRC rule types that OpenROAD drt module d
 | DRC Rule | Benchmark | Updated | Difference | Status |
 |---|---:|---:|---:|---|
 | `M1.S.2` | 2 | 4 | +2 | Increased |
-| `M4.AUX.1` | 6 | 32 | +26 | Increased |
+| `M4.AUX.1` | 6 | 8 | +2 | Increased |
 | `M4.AUX.2` | 1 | 0 | -1 | Removed |
 | `M4.S.5` | 1 | 0 | -1 | Removed |
-| `M5.AUX.1` | 4 | 8 | +4 | Increased |
+| `M5.AUX.1` | 4 | 4 | 0 | Unchanged |
 | `V0.M1.AUX.3` | 12 | 7 | -5 | Decreased |
 | `V1.M1.EN.1` | 2 | 8 | +6 | Increased |
 | `V2.M3.AUX.2` | 24 | 0 | -24 | Removed |
@@ -121,9 +119,9 @@ The following table is the complete 49 DRC rule types that OpenROAD drt module d
 | `M1.S.5` | 0 | 2 | +2 | Added |
 | `M1.S.6` | 0 | 10 | +10 | Added |
 | `M2.S.7` | 0 | 2 | +2 | Added |
-| `M4.AUX.1` | 6 | 40 | +34 | Increased |
+| `M4.AUX.1` | 6 | 10 | +4 | Increased |
 | `M4.AUX.2` | 1 | 0 | -1 | Removed |
-| `M5.AUX.1` | 4 | 8 | +4 | Increased |
+| `M5.AUX.1` | 4 | 4 | 0 | Unchanged |
 | `V0.M1.AUX.3` | 21 | 25 | +4 | Increased |
 | `V1.M1.EN.1` | 6 | 17 | +11 | Increased |
 | `V2.M3.AUX.2` | 27 | 0 | -27 | Removed |
@@ -140,11 +138,11 @@ The following table is the complete 49 DRC rule types that OpenROAD drt module d
 | `M1.S.6` | 0 | 8 | +8 | Added |
 | `M2.S.7` | 0 | 3 | +3 | Added |
 | `M3.S.2` | 1 | 0 | -1 | Removed |
-| `M4.AUX.1` | 11 | 88 | +77 | Increased |
+| `M4.AUX.1` | 11 | 22 | +11 | Increased |
 | `M4.AUX.2` | 2 | 0 | -2 | Removed |
 | `M4.S.4` | 1 | 0 | -1 | Removed |
 | `M4.S.5` | 2 | 2 | 0 | Unchanged |
-| `M5.AUX.1` | 6 | 16 | +10 | Increased |
+| `M5.AUX.1` | 6 | 8 | +2 | Increased |
 | `M6.AUX.1` | 1 | 0 | -1 | Removed |
 | `V0.M1.AUX.3` | 20 | 24 | +4 | Increased |
 | `V1.M1.EN.1` | 4 | 23 | +19 | Increased |
@@ -160,10 +158,10 @@ The following table is the complete 49 DRC rule types that OpenROAD drt module d
 | `M1.S.2` | 6 | 3 | -3 | Decreased |
 | `M1.S.6` | 2 | 4 | +2 | Increased |
 | `M3.S.2` | 1 | 0 | -1 | Removed |
-| `M4.AUX.1` | 5 | 24 | +19 | Increased |
+| `M4.AUX.1` | 5 | 6 | +1 | Increased |
 | `M4.AUX.2` | 1 | 0 | -1 | Removed |
 | `M4.S.5` | 0 | 1 | +1 | Added |
-| `M5.AUX.1` | 4 | 8 | +4 | Increased |
+| `M5.AUX.1` | 4 | 4 | 0 | Unchanged |
 | `V0.M1.AUX.3` | 9 | 6 | -3 | Decreased |
 | `V1.M1.EN.1` | 5 | 2 | -3 | Decreased |
 | `V2.M3.AUX.2` | 21 | 0 | -21 | Removed |
@@ -179,9 +177,9 @@ The following table is the complete 49 DRC rule types that OpenROAD drt module d
 | `M1.S.6` | 4 | 8 | +4 | Increased |
 | `M2.S.7` | 0 | 3 | +3 | Added |
 | `M3.S.2` | 3 | 0 | -3 | Removed |
-| `M4.AUX.1` | 18 | 96 | +78 | Increased |
+| `M4.AUX.1` | 18 | 24 | +6 | Increased |
 | `M4.AUX.2` | 4 | 0 | -4 | Removed |
-| `M5.AUX.1` | 8 | 16 | +8 | Increased |
+| `M5.AUX.1` | 8 | 8 | 0 | Unchanged |
 | `M6.AUX.1` | 4 | 0 | -4 | Removed |
 | `V0.M1.AUX.3` | 21 | 18 | -3 | Decreased |
 | `V1.M1.EN.1` | 10 | 12 | +2 | Increased |
@@ -200,10 +198,10 @@ The following table is the complete 49 DRC rule types that OpenROAD drt module d
 | `M1.S.6` | 34 | 58 | +24 | Increased |
 | `M2.S.7` | 4 | 18 | +14 | Increased |
 | `M3.S.2` | 15 | 0 | -15 | Removed |
-| `M4.AUX.1` | 54 | 288 | +234 | Increased |
+| `M4.AUX.1` | 54 | 72 | +18 | Increased |
 | `M4.AUX.2` | 9 | 0 | -9 | Removed |
 | `M4.S.5` | 1 | 2 | +1 | Increased |
-| `M5.AUX.1` | 12 | 24 | +12 | Increased |
+| `M5.AUX.1` | 12 | 12 | 0 | Unchanged |
 | `M6.AUX.1` | 6 | 0 | -6 | Removed |
 | `V0.M1.AUX.3` | 97 | 81 | -16 | Decreased |
 | `V1.M1.EN.1` | 26 | 95 | +69 | Increased |
