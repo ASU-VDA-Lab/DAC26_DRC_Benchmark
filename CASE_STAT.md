@@ -6,7 +6,7 @@
 | ----------- | ----: | ---------------: | -----------: | ------------------: | ------: | --: | --: |
 | Cell        |   255 |            3,690 |            4 |                14.5 |     4.2 |   6 |  26 |
 | Polygon     |   332 |            1,620 |          332 |                 4.9 |    15.5 |   1 | 244 |
-| Block       |     7 |            1,628 |           17 |               232.6 |   228.6 |  68 | 765 |
+| Block       |     7 |            1,627 |           12 |               232.4 |   209.9 |  54 | 719 |
 
 ---
 
@@ -14,25 +14,27 @@
 
 | Block | Instances | Nets | Die Area (um²) | Core Area (um²) | Die (W x H um) | Core (W x H um) |
 | ------ | --------- | ---- | -------------- | --------------- | -------------- | --------------- |
-| Block1 | 143 | 120 | 16.06 | 9.30 | 4.008 x 4.008 | 3.132 x 2.970 |
-| Block2 | 62 | 43 | 8.99 | 4.08 | 2.998 x 2.998 | 2.160 x 1.890 |
-| Block3 | 76 | 62 | 10.07 | 5.02 | 3.174 x 3.174 | 2.322 x 2.160 |
-| Block4 | 107 | 81 | 13.45 | 7.58 | 3.668 x 3.668 | 2.808 x 2.700 |
-| Block5 | 47 | 28 | 7.27 | 2.97 | 2.696 x 2.696 | 1.836 x 1.620 |
-| Block6 | 155 | 101 | 17.94 | 11.02 | 4.236 x 4.236 | 3.402 x 3.240 |
-| Block7 | 574 | 410 | 57.91 | 43.74 | 7.610 x 7.610 | 6.750 x 6.480 |
+| Block1 | 176 | 112 | 19.01 | 11.37 | 4.360 x 4.360 | 3.510 x 3.240 |
+| Block2 | 60 | 38 | 8.41 | 3.88 | 2.900 x 2.900 | 2.052 x 1.890 |
+| Block3 | 108 | 71 | 12.60 | 6.56 | 3.550 x 3.550 | 2.700 x 2.430 |
+| Block4 | 117 | 77 | 14.14 | 7.87 | 3.760 x 3.760 | 2.916 x 2.700 |
+| Block5 | 40 | 18 | 7.27 | 2.41 | 2.696 x 2.696 | 1.782 x 1.350 |
+| Block6 | 154 | 80 | 17.94 | 9.94 | 4.236 x 4.236 | 3.348 x 2.970 |
+| Block7 | 542 | 326 | 57.91 | 41.58 | 7.610 x 7.610 | 6.696 x 6.210 |
+
+Block physical statistics are derived from each design's `6_final.def` under `/home/bingyuew/OpenROAD-flow-scripts/flow/results/asap7`. `Instances` is the DEF `COMPONENTS` count. `Nets` is the DEF `NETS` count and excludes the two `SPECIALNETS` (VDD and VSS) in each design. Die dimensions come from `DIEAREA`; core dimensions are the bounding box of all `ROW` sites.
 
 ### Block DRC Violations
 
 | Block | Total Violations | Rules Violated | Violation Breakdown |
 | ------ | ---------------: | -------------: | ------------------- |
-| Block1 | 244 | 14 | M1.S.2 (12), M1.S.4 (2), M2.S.7 (1), M3.S.2 (2), M4.AUX.1 (18), M4.AUX.2 (2), M4.S.5 (4), M5.AUX.1 (8), M6.AUX.1 (3), V0.M1.AUX.3 (37), V1.M1.EN.1 (11), V2.M3.AUX.2 (72), V4.M5.AUX.2 (48), V5.M6.AUX.2 (24) |
-| Block2 | 68 | 9 | M1.S.2 (2), M4.AUX.1 (6), M4.AUX.2 (1), M4.S.5 (1), M5.AUX.1 (4), V0.M1.AUX.3 (12), V1.M1.EN.1 (2), V2.M3.AUX.2 (24), V4.M5.AUX.2 (16) |
-| Block3 | 89 | 9 | M1.S.2 (5), M1.S.4 (1), M4.AUX.1 (6), M4.AUX.2 (1), M5.AUX.1 (4), V0.M1.AUX.3 (21), V1.M1.EN.1 (6), V2.M3.AUX.2 (27), V4.M5.AUX.2 (18) |
-| Block4 | 147 | 13 | M1.S.2 (8), M3.S.2 (1), M4.AUX.1 (11), M4.AUX.2 (2), M4.S.4 (1), M4.S.5 (2), M5.AUX.1 (6), M6.AUX.1 (1), V0.M1.AUX.3 (20), V1.M1.EN.1 (4), V2.M3.AUX.2 (51), V4.M5.AUX.2 (34), V5.M6.AUX.2 (6) |
-| Block5 | 68 | 10 | M1.S.2 (6), M1.S.6 (2), M3.S.2 (1), M4.AUX.1 (5), M4.AUX.2 (1), M5.AUX.1 (4), V0.M1.AUX.3 (9), V1.M1.EN.1 (5), V2.M3.AUX.2 (21), V4.M5.AUX.2 (14) |
-| Block6 | 247 | 13 | M1.S.2 (12), M1.S.4 (1), M1.S.6 (4), M3.S.2 (3), M4.AUX.1 (18), M4.AUX.2 (4), M5.AUX.1 (8), M6.AUX.1 (4), V0.M1.AUX.3 (21), V1.M1.EN.1 (10), V2.M3.AUX.2 (78), V4.M5.AUX.2 (52), V5.M6.AUX.2 (32) |
-| Block7 | 765 | 16 | M1.S.2 (25), M1.S.4 (21), M1.S.5 (14), M1.S.6 (34), M2.S.7 (4), M3.S.2 (15), M4.AUX.1 (54), M4.AUX.2 (9), M4.S.5 (1), M5.AUX.1 (12), M6.AUX.1 (6), V0.M1.AUX.3 (97), V1.M1.EN.1 (26), V2.M3.AUX.2 (225), V4.M5.AUX.2 (150), V5.M6.AUX.2 (72) |
+| Block1 | 253 | 11 | M1.S.2 (31), M1.S.5 (1), M1.S.6 (12), M2.S.7 (5), M4.AUX.1 (104), M4.S.4 (1), M4.S.5 (2), M5.AUX.1 (16), V0.M1.AUX.3 (25), V1.M1.EN.1 (30), V3.M4.AUX.2 (26) |
+| Block2 | 67 | 6 | M1.S.2 (4), M4.AUX.1 (32), M5.AUX.1 (8), V0.M1.AUX.3 (7), V1.M1.EN.1 (8), V3.M4.AUX.2 (8) |
+| Block3 | 134 | 10 | M1.S.2 (17), M1.S.4 (3), M1.S.5 (2), M1.S.6 (10), M2.S.7 (2), M4.AUX.1 (40), M5.AUX.1 (8), V0.M1.AUX.3 (25), V1.M1.EN.1 (17), V3.M4.AUX.2 (10) |
+| Block4 | 208 | 11 | M1.S.2 (18), M1.S.4 (2), M1.S.5 (2), M1.S.6 (8), M2.S.7 (3), M4.AUX.1 (88), M4.S.5 (2), M5.AUX.1 (16), V0.M1.AUX.3 (24), V1.M1.EN.1 (23), V3.M4.AUX.2 (22) |
+| Block5 | 54 | 8 | M1.S.2 (3), M1.S.6 (4), M4.AUX.1 (24), M4.S.5 (1), M5.AUX.1 (8), V0.M1.AUX.3 (6), V1.M1.EN.1 (2), V3.M4.AUX.2 (6) |
+| Block6 | 192 | 9 | M1.S.2 (12), M1.S.4 (3), M1.S.6 (8), M2.S.7 (3), M4.AUX.1 (96), M5.AUX.1 (16), V0.M1.AUX.3 (18), V1.M1.EN.1 (12), V3.M4.AUX.2 (24) |
+| Block7 | 719 | 11 | M1.S.2 (61), M1.S.4 (12), M1.S.5 (8), M1.S.6 (58), M2.S.7 (18), M4.AUX.1 (288), M4.S.5 (2), M5.AUX.1 (24), V0.M1.AUX.3 (81), V1.M1.EN.1 (95), V3.M4.AUX.2 (72) |
 
 ---
 

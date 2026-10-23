@@ -29,23 +29,32 @@
 #OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 #################################################################################
 #check_connectivity.py — Validate that electrical connectivity is preserved
-#after LLM DRC repair by comparing golden JSON paths against the modified
-#script's traced paths.
+#after LLM DRC repair by comparing the golden connectivity JSON against the
+#modified script's traced connectivity.
 #
-#Comparison rules (unified cell/block framework):
-#  Step 1 — Seed validation: locate each golden seed polygon in the modified
-#           script by canonical points. Seed layer is immutable (M0 for cell,
-#           non-VIA M1 for block). Missing seed → fail.
+#Cell comparison rules (golden "paths"):
+#  Step 1 — Seed validation: locate each golden seed polygon (M0) in the
+#           modified script by canonical points. Missing seed → fail.
 #  Step 2 — Endpoint validation per seed:
-#           - Immutable-layer endpoints (M0 for cell, M1 for block): canonical
-#             points must match exactly as a multiset.
-#           - Mutable-layer endpoints: count per layer must match.
+#           - M0 endpoints: canonical points must match exactly as a multiset.
+#           - Other endpoints: count per layer must match.
+#
+#Block comparison rules (golden "terminals" + "pairs"):
+#  Starts : standard-cell M1 polygons, plus the VDD/VSS M1 rails (top-cell M1
+#           rectangles of rail height spanning at least half the outline).
+#  Trace  : polygon-level BFS over metal (same-layer touch/overlap) and via
+#           (positive-area overlap) adjacency. The BFS records and stops at
+#           (a) any other standard-cell M1 polygon, and (b) any metal polygon
+#           carrying (layer, 251) pin shapes (all its pins are recorded).
+#           A start that reaches nothing is recorded as (start, null).
+#  Compare: the multiset of (start, end) pairs, keyed by canonical points,
+#           must match the golden exactly. Missing / extra start → fail.
 
 import json
 import re
 import sys
 import os
-from collections import defaultdict, Counter
+from collections import defaultdict, deque, Counter
 from pathlib import Path
 
 from shapely.geometry import Polygon as ShapelyPolygon
@@ -89,16 +98,13 @@ BLOCK_ALL_LAYERS = BLOCK_METAL_LAYERS | BLOCK_VIA_LAYERS
 BLOCK_SEED_LAYER = 19
 BLOCK_VIA_TO_BELOW_ABOVE = {v: (b, a) for b, v, a in BLOCK_STACK}
 
-BLOCK_HIGHEST_LAYER = {
-    "Block1": 60, "Block2": 50, "Block3": 50, "Block4": 60,
-    "Block5": 50, "Block6": 60, "Block7": 60,
-}
-
-BLOCK_PIN_LAYERS = {40, 50, 60, 70}
+BLOCK_PIN_DATATYPE = 251
+BLOCK_OUTLINE_LAYER = 235
+BLOCK_RAIL_HEIGHT = 72          # VDD/VSS M1 rail height (18 nm)
+BLOCK_GRID_BUCKET = 2048        # spatial-index bucket size (dbu)
 
 # Metal above-via lookup (for directional rule)
 CELL_METAL_ABOVE_VIA = {b: v for b, v, a in CELL_STACK}
-BLOCK_METAL_ABOVE_VIA = {b: v for b, v, a in BLOCK_STACK}
 
 
 # ===================================================================
@@ -373,79 +379,6 @@ def parse_block_script(script_path):
     return dict(flat_shapes)
 
 
-def parse_block_pins(script_path):
-    """Extract (layer, 251) pin polygons from a block layout script.
-
-    Pin polygons are on layers in BLOCK_PIN_LAYERS with datatype 251.
-    They are always in the top cell so no transforms are needed.
-
-    Returns: dict  layer_num -> list of canonicalized point lists
-    """
-    with Path(script_path).open("r") as fh:
-        lines = fh.readlines()
-
-    poly_points = {}
-    for line in lines:
-        line = line.rstrip()
-        m = RE_BLK_POLY_DEF.match(line)
-        if m:
-            pts = [(int(p[0]), int(p[1]))
-                   for p in RE_BLK_POINT.findall(m.group(2))]
-            if pts:
-                poly_points[m.group(1)] = pts
-
-    pins_by_layer = defaultdict(list)
-    for line in lines:
-        line = line.rstrip()
-        m = RE_BLK_SHAPE_INSERT.match(line)
-        if m:
-            layer_num = int(m.group(2))
-            datatype = int(m.group(3))
-            shape_var = m.group(4)
-            if datatype == 251 and layer_num in BLOCK_PIN_LAYERS:
-                if shape_var in poly_points:
-                    pins_by_layer[layer_num].append(
-                        canonicalize_points(poly_points[shape_var]))
-
-    # Pre-compute bboxes for fast overlap checks
-    pin_bboxes = {}
-    for lyr, pin_list in pins_by_layer.items():
-        pin_bboxes[lyr] = [compute_bbox(pts) for pts in pin_list]
-
-    return dict(pins_by_layer), pin_bboxes
-
-
-def remap_block_endpoints_to_pins(paths, pins_by_layer, pin_bboxes):
-    """Post-process traced block paths: remap endpoints on pin layers to
-    (layer, 251) pin polygons when they overlap, and set pin flag.
-
-    Rules:
-      - end.layer in BLOCK_PIN_LAYERS and overlaps a pin -> replace points, pin=True
-      - end.layer == BLOCK_SEED_LAYER (M1, 19) -> pin=True (no remap)
-      - all other -> pin=False
-    """
-    for path in paths:
-        el = path["end"]["layer"]
-        if el == BLOCK_SEED_LAYER:
-            path["end"]["pin"] = True
-        elif el in BLOCK_PIN_LAYERS and el in pins_by_layer:
-            ep_bbox = compute_bbox(path["end"]["points"])
-            matched = False
-            for i, pin_pts in enumerate(pins_by_layer[el]):
-                pb = pin_bboxes[el][i]
-                if (ep_bbox[0] < pb[2] and pb[0] < ep_bbox[2] and
-                        ep_bbox[1] < pb[3] and pb[1] < ep_bbox[3]):
-                    path["end"]["points"] = [list(p) for p in pin_pts]
-                    path["end"]["pin"] = True
-                    matched = True
-                    break
-            if not matched:
-                path["end"]["pin"] = False
-        else:
-            path["end"]["pin"] = False
-    return paths
-
-
 # ===================================================================
 # Shared: merge, graph, prune, DFS, expand
 # ===================================================================
@@ -569,7 +502,7 @@ def get_upper_vias_for(metal_key, adjacent_vias, vias, metal_above_via):
 
 
 def enumerate_paths(seed_key, adjacent_vias, vias, via_to_below_above,
-                    metal_above_via, highest_layer=None):
+                    metal_above_via):
     path_records = set()
     visited_vias = set()
     root_vl = adjacent_vias.get(seed_key, [])
@@ -622,9 +555,6 @@ def enumerate_paths(seed_key, adjacent_vias, vias, via_to_below_above,
                                            metal_above_via)
                 if upper:
                     child_vl = upper
-                elif highest_layer is not None and nm[0] == highest_layer:
-                    path_records.add((seed_key, ('metal', nm)))
-                    continue
                 else:
                     child_vl = child_all
             else:
@@ -650,41 +580,6 @@ def expand_cell_path(seed_key, endpoint, merged_metals, vias):
         end_origs = [{"points": via["points"],
                       "source_cell": via["source_cell"]}]
     else:
-        return
-    for so in seed_origs:
-        sp = canonicalize_points(so["points"])
-        sc = so["source_cell"]
-        for eo in end_origs:
-            ep = canonicalize_points(eo["points"])
-            ec = eo["source_cell"]
-            yield {"start": {"layer": sl, "points": sp, "source_cell": sc},
-                   "end": {"layer": el, "points": ep, "source_cell": ec}}
-
-
-def _is_via(name):
-    return name.startswith("VIA_")
-
-
-def expand_block_path(seed_key, endpoint, merged_metals, vias):
-    sl, ss = seed_key
-    seed_origs = [o for o in merged_metals[sl][ss]["originals"]
-                  if not _is_via(o["source_cell"])]
-    if not seed_origs:
-        return
-    if endpoint[0] == 'metal':
-        el, es = endpoint[1]
-        end_origs = [o for o in merged_metals[el][es]["originals"]
-                     if not _is_via(o["source_cell"])]
-    elif endpoint[0] == 'dead_via':
-        via = vias[endpoint[1]]
-        if _is_via(via["source_cell"]):
-            return
-        el = via["layer"]
-        end_origs = [{"points": via["points"],
-                      "source_cell": via["source_cell"]}]
-    else:
-        return
-    if not end_origs:
         return
     for so in seed_origs:
         sp = canonicalize_points(so["points"])
@@ -726,31 +621,408 @@ def trace_modified_cell(modified_script_path):
     return paths
 
 
-def trace_modified_block(modified_script_path, case_name):
-    polys = parse_block_script(modified_script_path)
-    merged = merge_same_layer_metals(polys, BLOCK_METAL_LAYERS)
-    adj, vias = build_graph(merged, polys, BLOCK_VIA_LAYERS,
-                            BLOCK_VIA_TO_BELOW_ABOVE)
-    adj, _ = prune_redundant_vias(adj, vias, BLOCK_VIA_LAYERS,
-                                  BLOCK_VIA_TO_BELOW_ABOVE)
-    hl = BLOCK_HIGHEST_LAYER.get(case_name)
-    seeds = merged.get(BLOCK_SEED_LAYER, [])
-    records = set()
-    for sp in seeds:
-        sk = (BLOCK_SEED_LAYER, sp["super_id"])
-        records.update(enumerate_paths(
-            sk, adj, vias, BLOCK_VIA_TO_BELOW_ABOVE,
-            BLOCK_METAL_ABOVE_VIA, highest_layer=hl))
-    paths = []
-    for sk, ep in sorted(records, key=lambda r: (r[0], str(r[1]))):
-        for row in expand_block_path(sk, ep, merged, vias):
-            paths.append(row)
+# ===================================================================
+# Block: polygon-level BFS producing (start, end) pairs
+# ===================================================================
 
-    # Parse (layer, 251) pin polygons and remap endpoints
-    pins_by_layer, pin_bboxes = parse_block_pins(modified_script_path)
-    remap_block_endpoints_to_pins(paths, pins_by_layer, pin_bboxes)
+BLOCK_KIND_ORDER = {"pdn_rail": 0, "std_m1": 1, "pin": 2}
 
-    return paths
+
+def parse_block_top_items(script_path):
+    """Return (top_name, outline_bbox, pins) from a block layout script.
+
+    pins: list of (layer, points) for (layer, 251) shapes on block metal
+    layers inserted directly into the top cell. outline_bbox is the bbox of
+    the top-cell (235, 0) shapes, or None when absent.
+    """
+    with Path(script_path).open("r") as fh:
+        lines = [line.rstrip() for line in fh]
+
+    var_to_cell_name = {}
+    poly_points = {}
+    top_var = None
+    for line in lines:
+        m = RE_BLK_CREATE_CELL.match(line)
+        if m:
+            var_to_cell_name[m.group(1)] = m.group(2)
+            top_var = m.group(1)
+            continue
+        m = RE_BLK_POLY_DEF.match(line)
+        if m:
+            pts = [(int(p[0]), int(p[1]))
+                   for p in RE_BLK_POINT.findall(m.group(2))]
+            if pts:
+                poly_points[m.group(1)] = pts
+
+    pins = []
+    outline_pts = []
+    for line in lines:
+        m = RE_BLK_SHAPE_INSERT.match(line)
+        if not m or m.group(1) != top_var or m.group(4) not in poly_points:
+            continue
+        layer_num, datatype = int(m.group(2)), int(m.group(3))
+        pts = poly_points[m.group(4)]
+        if datatype == BLOCK_PIN_DATATYPE and layer_num in BLOCK_METAL_LAYERS:
+            pins.append((layer_num, pts))
+        elif layer_num == BLOCK_OUTLINE_LAYER and datatype == 0:
+            outline_pts.extend(pts)
+
+    outline = compute_bbox(outline_pts) if outline_pts else None
+    return var_to_cell_name.get(top_var), outline, pins
+
+
+def _rect_of(points):
+    """Return (x0, y0, x1, y1) if points form an axis-aligned rectangle."""
+    if len(points) != 4:
+        return None
+    for i in range(4):
+        (ax, ay), (bx, by) = points[i], points[(i + 1) % 4]
+        if ax != bx and ay != by:
+            return None
+    xs = sorted(set(p[0] for p in points))
+    ys = sorted(set(p[1] for p in points))
+    if len(xs) != 2 or len(ys) != 2:
+        return None
+    return (xs[0], ys[0], xs[1], ys[1])
+
+
+class _BlockShape(object):
+    __slots__ = ("layer", "points", "source_cell", "bbox", "rect", "_geom")
+
+    def __init__(self, layer, points, source_cell):
+        self.layer = layer
+        self.points = points
+        self.source_cell = source_cell
+        self.bbox = compute_bbox(points)
+        self.rect = _rect_of(points)
+        self._geom = None
+
+    def geom(self):
+        if self._geom is None:
+            self._geom = safe_polygon(self.points)
+        return self._geom
+
+
+def _shapes_connect(a, b, need_area):
+    """Electrical contact test between two shapes.
+
+    need_area=False (same-layer metal): overlap, or a shared edge segment of
+    positive length. need_area=True (via-metal, pin-metal): positive-area
+    overlap. Corner-only contact never connects.
+    """
+    ix = min(a.bbox[2], b.bbox[2]) - max(a.bbox[0], b.bbox[0])
+    iy = min(a.bbox[3], b.bbox[3]) - max(a.bbox[1], b.bbox[1])
+    if ix < 0 or iy < 0 or (ix == 0 and iy == 0):
+        return False
+    if need_area and (ix == 0 or iy == 0):
+        return False
+    if a.rect is not None and b.rect is not None:
+        return True
+    ga, gb = a.geom(), b.geom()
+    if ga is None or gb is None:
+        return False
+    try:
+        inter = ga.intersection(gb)
+    except Exception:
+        return False
+    if inter.is_empty:
+        return False
+    return inter.area > 0 or (not need_area and inter.length > 0)
+
+
+class _GridIndex(object):
+    """Uniform-grid bbox index (shapely-version independent)."""
+
+    def __init__(self, items, bucket=BLOCK_GRID_BUCKET):
+        self.bucket = bucket
+        self.cells = defaultdict(list)
+        for idx, bb in items:
+            for key in self._keys(bb):
+                self.cells[key].append(idx)
+
+    def _keys(self, bb):
+        q = self.bucket
+        for gx in range(bb[0] // q, bb[2] // q + 1):
+            for gy in range(bb[1] // q, bb[3] // q + 1):
+                yield (gx, gy)
+
+    def query(self, bb):
+        seen = set()
+        for key in self._keys(bb):
+            for idx in self.cells.get(key, ()):
+                if idx not in seen:
+                    seen.add(idx)
+        return seen
+
+
+class BlockGraph(object):
+    """Flattened block shapes with metal/via adjacency and pin attachment."""
+
+    def __init__(self, script_path):
+        self.top_name, self.outline, pin_list = parse_block_top_items(
+            script_path)
+        flat = parse_block_script(script_path)
+        self.shapes = []
+        for layer in sorted(flat):
+            for s in flat[layer]:
+                self.shapes.append(
+                    _BlockShape(layer, s["points"], s["source_cell"]))
+        self.pins = [_BlockShape(layer, pts, self.top_name)
+                     for layer, pts in pin_list]
+
+        by_layer = defaultdict(list)
+        for i, s in enumerate(self.shapes):
+            by_layer[s.layer].append(i)
+        index = {layer: _GridIndex([(i, self.shapes[i].bbox) for i in ids])
+                 for layer, ids in by_layer.items()}
+
+        self.adj = [set() for _ in self.shapes]
+        for layer in sorted(BLOCK_METAL_LAYERS):
+            for i in by_layer.get(layer, []):
+                for j in index[layer].query(self.shapes[i].bbox):
+                    if j > i and _shapes_connect(self.shapes[i],
+                                                 self.shapes[j], False):
+                        self.adj[i].add(j)
+                        self.adj[j].add(i)
+        for via_layer in sorted(BLOCK_VIA_LAYERS):
+            for v in by_layer.get(via_layer, []):
+                for ml in BLOCK_VIA_TO_BELOW_ABOVE[via_layer]:
+                    if ml not in index:
+                        continue
+                    for m in index[ml].query(self.shapes[v].bbox):
+                        if _shapes_connect(self.shapes[v], self.shapes[m],
+                                           True):
+                            self.adj[v].add(m)
+                            self.adj[m].add(v)
+
+        self.pins_on = defaultdict(list)
+        for p, pin in enumerate(self.pins):
+            if pin.layer not in index:
+                continue
+            for m in index[pin.layer].query(pin.bbox):
+                if _shapes_connect(pin, self.shapes[m], True):
+                    self.pins_on[m].append(p)
+
+        if self.outline is not None:
+            width = self.outline[2] - self.outline[0]
+        elif self.shapes:
+            width = (max(s.bbox[2] for s in self.shapes)
+                     - min(s.bbox[0] for s in self.shapes))
+        else:
+            width = 0
+        self.kind = [self._classify(s, width) for s in self.shapes]
+
+    def _classify(self, s, outline_width):
+        """Start kind of a shape: "std_m1", "pdn_rail" or None."""
+        if s.layer != BLOCK_SEED_LAYER:
+            return None
+        if s.source_cell == self.top_name:
+            r = s.rect
+            if (r is not None and r[3] - r[1] == BLOCK_RAIL_HEIGHT
+                    and 2 * (r[2] - r[0]) >= outline_width):
+                return "pdn_rail"
+            return None
+        if s.source_cell.startswith("VIA_"):
+            return None
+        return "std_m1"
+
+    def starts(self):
+        return [i for i, k in enumerate(self.kind) if k is not None]
+
+    def shape_key(self, i):
+        s = self.shapes[i]
+        return (self.kind[i], s.layer,
+                points_key(canonicalize_points(s.points)))
+
+    def pin_key(self, p):
+        pin = self.pins[p]
+        return ("pin", pin.layer,
+                points_key(canonicalize_points(pin.points)))
+
+    def endpoints(self, seed):
+        """BFS from seed; stop at other std-cell M1 and at pin-carrying metal.
+
+        Returns a list of end keys (one per distinct end shape / pin).
+        """
+        seen = {seed}
+        queue = deque([seed])
+        ends = []
+        while queue:
+            u = queue.popleft()
+            if u != seed:
+                if self.kind[u] == "std_m1":
+                    ends.append(self.shape_key(u))
+                    continue
+                if self.pins_on.get(u):
+                    ends.extend(self.pin_key(p) for p in self.pins_on[u])
+                    continue
+            elif self.pins_on.get(u):
+                ends.extend(self.pin_key(p) for p in self.pins_on[u])
+            for w in self.adj[u]:
+                if w not in seen:
+                    seen.add(w)
+                    queue.append(w)
+        return ends
+
+
+def trace_block_pairs(script_path):
+    """Trace a block script into a list of (start_key, end_key|None) pairs.
+
+    Keys are (kind, layer, canonical points) with kind "pdn_rail", "std_m1"
+    or "pin". Returns (graph, pairs).
+    """
+    g = BlockGraph(script_path)
+    pairs = []
+    for s in g.starts():
+        sk = g.shape_key(s)
+        ends = g.endpoints(s)
+        if not ends:
+            pairs.append((sk, None))
+        for ek in sorted(ends):
+            pairs.append((sk, ek))
+    return g, pairs
+
+
+def _terminal_sort_key(key):
+    return (BLOCK_KIND_ORDER[key[0]], key[1], key[2])
+
+
+def encode_block_pairs(case_name, pairs, extra=None):
+    """Build the golden block JSON object (terminals + id pairs).
+
+    extra: optional {terminal_key: {field: value}} merged into terminals
+    (e.g. source_cell, net); comparison ignores these fields.
+    """
+    extra = extra or {}
+    keys = set(s for s, _ in pairs) | set(e for _, e in pairs if e is not None)
+    keys = sorted(keys, key=_terminal_sort_key)
+    ids = {k: i for i, k in enumerate(keys)}
+    terminals = []
+    for k in keys:
+        t = {"id": ids[k], "kind": k[0], "layer": k[1],
+             "points": [list(p) for p in k[2]]}
+        t.update(extra.get(k, {}))
+        terminals.append(t)
+    rows = sorted([ids[s], -1 if e is None else ids[e]] for s, e in pairs)
+    return {
+        "case": case_name,
+        "design_type": "block",
+        "num_terminals": len(terminals),
+        "num_pairs": len(rows),
+        "terminals": terminals,
+        "pairs": [[s, None if e < 0 else e] for s, e in rows],
+    }
+
+
+def decode_block_pairs(data):
+    keys = {}
+    for t in data["terminals"]:
+        pts = [tuple(p) for p in t["points"]]
+        keys[t["id"]] = (t["kind"], t["layer"],
+                         points_key(canonicalize_points(pts)))
+    return [(keys[s], None if e is None else keys[e])
+            for s, e in data["pairs"]]
+
+
+def _key_to_json(key):
+    return {"kind": key[0], "layer": key[1],
+            "points": [list(p) for p in key[2]]}
+
+
+def compare_block_pairs(golden_pairs, modified_pairs):
+    gc = Counter(golden_pairs)
+    mc = Counter(modified_pairs)
+    missing = gc - mc
+    extra = mc - gc
+
+    g_seeds = set(s for s, _ in golden_pairs)
+    m_seeds = set(s for s, _ in modified_pairs)
+    missing_seeds = sorted(g_seeds - m_seeds, key=_terminal_sort_key)
+    extra_seeds = sorted(m_seeds - g_seeds, key=_terminal_sort_key)
+    skip = set(missing_seeds) | set(extra_seeds)
+
+    # Per-seed endpoint differences, split into 251-pin vs std-cell M1 ends
+    # (a lost or gained "no endpoint" record counts as an M1 difference).
+    pin_diff = defaultdict(lambda: {"missing": [], "extra": []})
+    m1_diff = defaultdict(lambda: {"missing": [], "extra": []})
+    for side, counter in (("missing", missing), ("extra", extra)):
+        for (s, e), n in counter.items():
+            if s in skip:
+                continue
+            bucket = pin_diff if (e is not None and e[0] == "pin") else m1_diff
+            bucket[s][side].extend([e] * n)
+
+    def detail(diff):
+        rows = []
+        for s in sorted(diff, key=_terminal_sort_key)[:10]:
+            d = diff[s]
+            rows.append({
+                "seed": _key_to_json(s),
+                "missing_endpoints": [None if e is None else _key_to_json(e)
+                                      for e in d["missing"][:5]],
+                "extra_endpoints": [None if e is None else _key_to_json(e)
+                                    for e in d["extra"][:5]],
+                "missing_count": len(d["missing"]),
+                "extra_count": len(d["extra"]),
+            })
+        return rows
+
+    passed = not missing and not extra
+    n_missing_pairs = sum(missing.values())
+    n_extra_pairs = sum(extra.values())
+    if passed:
+        details = ("All {} seeds verified; {} start-end pairs match exactly. "
+                   "Connectivity preserved.".format(len(g_seeds),
+                                                    len(golden_pairs)))
+    else:
+        parts = []
+        if missing_seeds:
+            parts.append("{} seed(s) missing".format(len(missing_seeds)))
+        if extra_seeds:
+            parts.append("{} extra seed(s)".format(len(extra_seeds)))
+        if pin_diff:
+            parts.append("{} seed(s) with 251-pin endpoint mismatch".format(
+                len(pin_diff)))
+        if m1_diff:
+            parts.append("{} seed(s) with std-cell M1 endpoint mismatch".format(
+                len(m1_diff)))
+        details = "FAILED: {} ({} missing / {} extra pairs). {} seeds checked.".format(
+            "; ".join(parts), n_missing_pairs, n_extra_pairs, len(g_seeds))
+
+    return {
+        "connectivity_preserved": passed,
+        "passed": passed,
+        "seeds_checked": len(g_seeds),
+        "seeds_missing": len(missing_seeds),
+        "extra_seeds": len(extra_seeds),
+        "pin_endpoint_mismatches": len(pin_diff),
+        "layer_count_mismatches": len(m1_diff),
+        "missing_pairs": n_missing_pairs,
+        "extra_pairs": n_extra_pairs,
+        "details": details,
+        "missing_seeds": [_key_to_json(s) for s in missing_seeds[:10]],
+        "extra_seeds_detail": [_key_to_json(s) for s in extra_seeds[:10]],
+        "pin_mismatches_detail": detail(pin_diff),
+        "layer_mismatches_detail": detail(m1_diff),
+    }
+
+
+def check_block_connectivity(golden_json_path, modified_script_path):
+    with open(str(golden_json_path)) as f:
+        data = json.load(f)
+    if "terminals" not in data or "pairs" not in data:
+        return {"connectivity_preserved": False, "passed": False,
+                "details": "Block golden JSON must contain 'terminals' and "
+                           "'pairs': {}".format(golden_json_path)}
+    golden_pairs = decode_block_pairs(data)
+    _, modified_pairs = trace_block_pairs(str(modified_script_path))
+    result = compare_block_pairs(golden_pairs, modified_pairs)
+    result["golden_json"] = str(golden_json_path)
+    result["modified_script"] = str(modified_script_path)
+    result["original_script"] = str(derive_original_script(golden_json_path))
+    result["golden_pairs_count"] = len(golden_pairs)
+    result["modified_pairs_count"] = len(modified_pairs)
+    return result
 
 
 # ===================================================================
@@ -890,6 +1162,9 @@ def check_connectivity(golden_json_path, modified_script_path, design_type):
         return {"connectivity_preserved": False, "passed": False,
                 "details": "Modified script not found: {}".format(mp)}
 
+    if design_type == "block":
+        return check_block_connectivity(gp, mp)
+
     case_name, _, golden_paths = load_golden_json(gp)
     if not golden_paths:
         return {"connectivity_preserved": True, "passed": True,
@@ -897,8 +1172,6 @@ def check_connectivity(golden_json_path, modified_script_path, design_type):
 
     if design_type == "cell":
         modified_paths = trace_modified_cell(str(mp))
-    elif design_type == "block":
-        modified_paths = trace_modified_block(str(mp), case_name)
     else:
         return {"connectivity_preserved": False, "passed": False,
                 "details": "Unknown design_type: {}".format(design_type)}

@@ -264,6 +264,13 @@ def _parse_layout_polygons(script_path: str) -> Dict[int, List[List[Tuple[int, i
     # transforms; we compose transforms recursively.
     with open(script_path) as f:
         src = f.read()
+    # Pin / label shapes (datatype 251) are not DRC geometry (the deck reads
+    # datatype 0 only); drop their insertions so dots never resolve to a pin.
+    src = re.sub(
+        r'^.*\.shapes\(\s*layout\.layer\(\s*'
+        r'(?:pya\.LayerInfo\(\s*\d+\s*,\s*251\s*\)|\d+\s*,\s*251)'
+        r'\s*\)\s*\)\.insert\(.*$',
+        '', src, flags=re.MULTILINE)
 
     poly_def = re.compile(
         r'^\s*(\w+)\s*=\s*pya\.Polygon\(\s*\[(.*?)\]\s*\)\s*$', re.MULTILINE)
